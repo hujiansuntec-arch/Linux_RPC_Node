@@ -1,16 +1,17 @@
 #include "nexus/registry/GlobalRegistry.h"
-#include "nexus/core/NodeImpl.h"  // librpc namespace
+#include "nexus/core/NodeImpl.h"  // Nexus::rpc namespace
 #include "nexus/core/Node.h"
 #include <algorithm>
 
-namespace nexus {
+namespace Nexus {
+namespace rpc {
 
 GlobalRegistry& GlobalRegistry::instance() {
     static GlobalRegistry registry;
     return registry;
 }
 
-void GlobalRegistry::registerNode(const std::string& node_id, std::weak_ptr<librpc::NodeImpl> node) {
+void GlobalRegistry::registerNode(const std::string& node_id, std::weak_ptr<Nexus::rpc::NodeImpl> node) {
     std::lock_guard<std::mutex> lock(nodes_mutex_);
     nodes_[node_id] = node;
 }
@@ -32,7 +33,7 @@ void GlobalRegistry::unregisterNode(const std::string& node_id) {
             // Remove all services from this node
             vec.erase(
                 std::remove_if(vec.begin(), vec.end(),
-                    [&node_id](const librpc::ServiceDescriptor& s) {
+                    [&node_id](const Nexus::rpc::ServiceDescriptor& s) {
                         return s.node_id == node_id;
                     }),
                 vec.end()
@@ -48,9 +49,9 @@ void GlobalRegistry::unregisterNode(const std::string& node_id) {
     }
 }
 
-std::vector<std::shared_ptr<librpc::NodeImpl>> GlobalRegistry::getAllNodes() {
+std::vector<std::shared_ptr<Nexus::rpc::NodeImpl>> GlobalRegistry::getAllNodes() {
     std::lock_guard<std::mutex> lock(nodes_mutex_);
-    std::vector<std::shared_ptr<librpc::NodeImpl>> result;
+    std::vector<std::shared_ptr<Nexus::rpc::NodeImpl>> result;
     
     for (auto it = nodes_.begin(); it != nodes_.end();) {
         if (auto node = it->second.lock()) {
@@ -65,7 +66,7 @@ std::vector<std::shared_ptr<librpc::NodeImpl>> GlobalRegistry::getAllNodes() {
     return result;
 }
 
-std::shared_ptr<librpc::NodeImpl> GlobalRegistry::findNode(const std::string& node_id) {
+std::shared_ptr<Nexus::rpc::NodeImpl> GlobalRegistry::findNode(const std::string& node_id) {
     std::lock_guard<std::mutex> lock(nodes_mutex_);
     auto it = nodes_.find(node_id);
     if (it != nodes_.end()) {
@@ -74,12 +75,51 @@ std::shared_ptr<librpc::NodeImpl> GlobalRegistry::findNode(const std::string& no
     return nullptr;
 }
 
-void GlobalRegistry::registerService(const std::string& group, const librpc::ServiceDescriptor& svc) {
+void GlobalRegistry::registerService(const std::string& group, const Nexus::rpc::ServiceDescriptor& svc) {
     std::lock_guard<std::mutex> lock(services_mutex_);
-    services_[group].push_back(svc);
+    auto& vec = services_[group];
+    
+    // ✅ Check for same service (same node + same capability) with different transport
+    // Priority: SHARED_MEMORY > UDP > INPROCESS
+    // If SHARED_MEMORY exists, reject UDP/INPROCESS registration
+    // If UDP exists and new is SHARED_MEMORY, replace UDP with SHARED_MEMORY
+    
+    std::string capability = svc.getCapability();  // group:topic
+    
+    for (auto it = vec.begin(); it != vec.end(); ++it) {
+        const auto& existing = *it;
+        
+        // Check if same node and same capability (group:topic)
+        if (existing.node_id == svc.node_id && existing.getCapability() == capability) {
+            // Same service from same node
+            
+            if (existing.transport == svc.transport) {
+                // Exact duplicate (same transport) - ignore
+                return;
+            }
+            
+            // Different transport for same service
+            if (existing.transport == Nexus::rpc::TransportType::SHARED_MEMORY) {
+                // SHARED_MEMORY already registered, reject UDP/INPROCESS
+                return;
+            }
+            
+            if (svc.transport == Nexus::rpc::TransportType::SHARED_MEMORY) {
+                // New registration is SHARED_MEMORY, replace existing UDP/INPROCESS
+                *it = svc;
+                return;
+            }
+            
+            // Both are non-SHARED_MEMORY (e.g., UDP vs INPROCESS), keep existing
+            return;
+        }
+    }
+    
+    // No conflict found, add new service
+    vec.push_back(svc);
 }
 
-void GlobalRegistry::unregisterService(const std::string& group, const librpc::ServiceDescriptor& svc) {
+void GlobalRegistry::unregisterService(const std::string& group, const Nexus::rpc::ServiceDescriptor& svc) {
     std::lock_guard<std::mutex> lock(services_mutex_);
     
     auto it = services_.find(group);
@@ -87,7 +127,7 @@ void GlobalRegistry::unregisterService(const std::string& group, const librpc::S
         auto& vec = it->second;
         vec.erase(
             std::remove_if(vec.begin(), vec.end(),
-                [&svc](const librpc::ServiceDescriptor& s) {
+                [&svc](const Nexus::rpc::ServiceDescriptor& s) {
                     return s.node_id == svc.node_id && 
                            s.topic == svc.topic;
                 }),
@@ -100,9 +140,9 @@ void GlobalRegistry::unregisterService(const std::string& group, const librpc::S
     }
 }
 
-std::vector<librpc::ServiceDescriptor> GlobalRegistry::findServices(const std::string& group) {
+std::vector<Nexus::rpc::ServiceDescriptor> GlobalRegistry::findServices(const std::string& group) {
     std::lock_guard<std::mutex> lock(services_mutex_);
-    std::vector<librpc::ServiceDescriptor> result;
+    std::vector<Nexus::rpc::ServiceDescriptor> result;
     
     if (group.empty()) {
         // Return all services - C++14 compatible iteration
@@ -140,4 +180,5 @@ size_t GlobalRegistry::getServiceCount() const {
     return count;
 }
 
-} // namespace nexus
+} // namespace rpc
+} // namespace Nexus

@@ -22,7 +22,8 @@
 #include <sys/procfs.h>
 #endif
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 SharedMemoryTransportV3::SharedMemoryTransportV3()
     : initialized_(false)
@@ -1146,4 +1147,5 @@ std::string SharedMemoryTransportV3::generateShmName() {
     return oss.str();
 }
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

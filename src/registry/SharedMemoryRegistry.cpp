@@ -14,7 +14,8 @@
 #include <sys/neutrino.h>
 #endif
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 SharedMemoryRegistry::SharedMemoryRegistry()
     : initialized_(false)
@@ -410,4 +411,5 @@ bool SharedMemoryRegistry::isProcessAlive(pid_t pid) const {
     return kill(pid, 0) == 0;
 }
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

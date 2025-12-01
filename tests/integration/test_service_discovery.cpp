@@ -18,7 +18,7 @@
 #include <cassert>
 #include <atomic>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 std::atomic<int> discovery_callback_count{0};
 

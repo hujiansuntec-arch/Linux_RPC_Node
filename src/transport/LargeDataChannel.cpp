@@ -18,7 +18,8 @@
 #include <mutex>
 #include <signal.h>  // 用于 kill() 检测进程存活
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 // 全局标志：是否已执行过启动清理
 static std::atomic<bool> g_cleanup_done{false};
@@ -842,4 +843,5 @@ void LargeDataChannel::cleanupDeadReaders() {
     }
 }
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

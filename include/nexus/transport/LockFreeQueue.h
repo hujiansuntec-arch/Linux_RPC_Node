@@ -6,7 +6,8 @@
 #include <cstring>
 #include <memory>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 /**
  * @brief Lock-free Single Producer Single Consumer (SPSC) ring buffer
@@ -162,4 +163,5 @@ private:
     alignas(64) Message buffer_[CAPACITY];
 };
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

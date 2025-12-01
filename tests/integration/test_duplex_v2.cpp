@@ -10,7 +10,7 @@
 #include <cstring>
 #include <memory>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 std::atomic<bool> g_running{true};
 

@@ -1,7 +1,8 @@
 #include "nexus/utils/Logger.h"
 #include <ctime>
 
-namespace nexus {
+namespace Nexus {
+namespace rpc {
 
 Logger& Logger::instance() {
     static Logger logger;
@@ -91,4 +92,5 @@ void Logger::log(Level level, const std::string& component, const std::string& m
     out << message << std::endl;
 }
 
-} // namespace nexus
+} // namespace rpc
+} // namespace Nexus

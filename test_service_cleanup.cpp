@@ -9,12 +9,12 @@
 #include <thread>
 #include <chrono>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 int main() {
     std::cout << "\n=== Testing Service Cleanup on Node Destruction ===\n\n";
     
-    auto& registry = nexus::GlobalRegistry::instance();
+    auto& registry = Nexus::rpc::GlobalRegistry::instance();
     
     // Step 1: Create a node and register services manually
     std::cout << "[Step 1] Creating node and registering services manually...\n";

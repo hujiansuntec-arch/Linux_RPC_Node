@@ -16,7 +16,7 @@
 #include <vector>
 #include <mutex>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 struct EventRecord {
     ServiceEvent event;

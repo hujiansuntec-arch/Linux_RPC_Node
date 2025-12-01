@@ -16,7 +16,7 @@ public:
         : node_id_(node_id), channel_name_(channel_name) {
         
         // 创建V3节点
-        node_ = librpc::createNode(node_id);
+        node_ = Nexus::rpc::createNode(node_id);
         if (!node_) {
             throw std::runtime_error("Failed to create node: " + node_id);
         }
@@ -30,7 +30,7 @@ public:
         // 使用 Node::sendLargeData() - 内部会自动处理通道创建和通知
         auto error = node_->sendLargeData("large_data", channel_name_, topic, 
                                          data.data(), data.size());
-        if (error != librpc::Node::NO_ERROR) {
+        if (error != Nexus::rpc::Node::NO_ERROR) {
             std::cerr << "Failed to send large data, error: " << static_cast<int>(error) << std::endl;
             return false;
         }
@@ -74,7 +74,7 @@ private:
     
     std::string node_id_;
     std::string channel_name_;
-    std::shared_ptr<librpc::Node> node_;
+    std::shared_ptr<Nexus::rpc::Node> node_;
 };
 
 int main(int argc, char* argv[]) {

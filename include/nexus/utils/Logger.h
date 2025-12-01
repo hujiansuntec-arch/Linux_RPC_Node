@@ -7,7 +7,8 @@
 #include <chrono>
 #include <iomanip>
 
-namespace nexus {
+namespace Nexus {
+namespace rpc {
 
 /**
  * @brief Unified logging system for Nexus
@@ -66,16 +67,16 @@ private:
 
 // Convenience macros
 #define NEXUS_LOG_DEBUG(component, msg) \
-    nexus::Logger::instance().log(nexus::Logger::Level::DEBUG, component, msg)
+    Nexus::rpc::Logger::instance().log(Nexus::rpc::Logger::Level::DEBUG, component, msg)
 
 #define NEXUS_LOG_INFO(component, msg) \
-    nexus::Logger::instance().log(nexus::Logger::Level::INFO, component, msg)
+    Nexus::rpc::Logger::instance().log(Nexus::rpc::Logger::Level::INFO, component, msg)
 
 #define NEXUS_LOG_WARN(component, msg) \
-    nexus::Logger::instance().log(nexus::Logger::Level::WARN, component, msg)
+    Nexus::rpc::Logger::instance().log(Nexus::rpc::Logger::Level::WARN, component, msg)
 
 #define NEXUS_LOG_ERROR(component, msg) \
-    nexus::Logger::instance().log(nexus::Logger::Level::ERROR, component, msg)
+    Nexus::rpc::Logger::instance().log(Nexus::rpc::Logger::Level::ERROR, component, msg)
 
 // Stream-style logging
 class LogStream {
@@ -100,15 +101,16 @@ private:
 };
 
 #define NEXUS_DEBUG(component) \
-    nexus::LogStream(nexus::Logger::Level::DEBUG, component)
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::DEBUG, component)
 
 #define NEXUS_INFO(component) \
-    nexus::LogStream(nexus::Logger::Level::INFO, component)
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::INFO, component)
 
 #define NEXUS_WARN(component) \
-    nexus::LogStream(nexus::Logger::Level::WARN, component)
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::WARN, component)
 
 #define NEXUS_ERROR(component) \
-    nexus::LogStream(nexus::Logger::Level::ERROR, component)
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::ERROR, component)
 
-} // namespace nexus
+} // namespace rpc
+} // namespace Nexus

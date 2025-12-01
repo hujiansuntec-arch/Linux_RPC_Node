@@ -12,7 +12,7 @@
 #include <vector>
 #include <signal.h>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 using namespace std::chrono;
 
 static std::atomic<bool> g_running{true};

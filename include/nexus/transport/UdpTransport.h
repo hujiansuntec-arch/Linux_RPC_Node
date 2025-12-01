@@ -8,7 +8,8 @@
 #include <thread>
 #include <mutex>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 /**
  * @brief UDP transport for inter-process communication
@@ -87,4 +88,5 @@ private:
     static constexpr const char* BROADCAST_ADDR = "255.255.255.255";
 };
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

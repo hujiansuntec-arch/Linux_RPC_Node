@@ -16,7 +16,8 @@
 #include <memory>
 #include <functional>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 // 大数据块头部
 struct LargeDataHeader {
@@ -259,4 +260,5 @@ struct LargeDataNotification {
 static_assert(sizeof(LargeDataNotification) == 128, 
               "LargeDataNotification must be 128 bytes");
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

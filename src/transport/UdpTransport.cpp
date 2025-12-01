@@ -1,4 +1,5 @@
 #include "nexus/transport/UdpTransport.h"
+#include "nexus/utils/Logger.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,7 +8,8 @@
 #include <cstring>
 #include <cerrno>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 UdpTransport::UdpTransport()
     : socket_fd_(-1)
@@ -183,6 +185,7 @@ void UdpTransport::receiveThread() {
             {
                 std::lock_guard<std::mutex> lock(callback_mutex_);
                 if (receive_callback_) {
+                    NEXUS_DEBUG("Dup") << "receive_callback_ ";
                     receive_callback_(buffer.data(), static_cast<size_t>(received), from_address);
                 }
             }
@@ -198,4 +201,5 @@ void UdpTransport::receiveThread() {
     }
 }
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

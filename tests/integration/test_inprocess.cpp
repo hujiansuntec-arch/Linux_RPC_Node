@@ -8,7 +8,7 @@
 #include <thread>
 #include <cstring>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 std::atomic<int> node1_received{0};
 std::atomic<int> node2_received{0};

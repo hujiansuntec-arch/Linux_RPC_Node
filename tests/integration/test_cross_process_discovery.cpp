@@ -16,7 +16,7 @@
 #include <atomic>
 #include <cstring>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 std::atomic<int> event_count{0};
 

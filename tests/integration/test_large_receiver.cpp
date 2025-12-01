@@ -23,7 +23,7 @@ public:
           running_(true) {
         
         // 创建V3节点
-        node_ = librpc::createNode(node_id);
+        node_ = Nexus::rpc::createNode(node_id);
         if (!node_) {
             throw std::runtime_error("Failed to create node: " + node_id);
         }
@@ -93,15 +93,15 @@ private:
     void onDataReady(const std::string& group, const std::string& topic,
                      const uint8_t* data, size_t size) {
         // 解析通知
-        if (size != sizeof(librpc::LargeDataNotification)) {
+        if (size != sizeof(Nexus::rpc::LargeDataNotification)) {
             std::cerr << "Invalid notification size: " << size << std::endl;
             return;
         }
         
-        auto* notif = reinterpret_cast<const librpc::LargeDataNotification*>(data);
+        auto* notif = reinterpret_cast<const Nexus::rpc::LargeDataNotification*>(data);
         
         // 从大数据通道读取
-        librpc::LargeDataChannel::DataBlock block;
+        Nexus::rpc::LargeDataChannel::DataBlock block;
         if (!large_channel_->tryRead(block)) {
             std::cerr << "Failed to read data block, seq: " << notif->sequence << std::endl;
             return;
@@ -179,8 +179,8 @@ private:
     
     std::string node_id_;
     std::string channel_name_;
-    std::shared_ptr<librpc::Node> node_;
-    std::shared_ptr<librpc::LargeDataChannel> large_channel_;
+    std::shared_ptr<Nexus::rpc::Node> node_;
+    std::shared_ptr<Nexus::rpc::LargeDataChannel> large_channel_;
     
     std::atomic<int> received_count_;
     std::atomic<uint64_t> total_bytes_;

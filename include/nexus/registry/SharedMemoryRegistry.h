@@ -8,7 +8,8 @@
 #include <cstdint>
 #include <sys/types.h>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 /**
  * @brief Node information in the registry
@@ -158,4 +159,5 @@ private:
     RegistryRegion* registry_;
 };
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

@@ -15,7 +15,8 @@
 #include <cstdint>
 #include <semaphore.h>
 
-namespace librpc {
+namespace Nexus {
+namespace rpc {
 
 // Forward declaration
 class NodeImpl;
@@ -295,4 +296,5 @@ private:
     std::atomic<uint64_t> stats_bytes_received_{0};
 };
 
-} // namespace librpc
+} // namespace rpc
+} // namespace Nexus

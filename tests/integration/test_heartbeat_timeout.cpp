@@ -19,7 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 
 struct EventRecord {
     ServiceEvent event;

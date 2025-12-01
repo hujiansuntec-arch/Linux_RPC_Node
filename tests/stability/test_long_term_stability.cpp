@@ -27,7 +27,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
-using namespace librpc;
+using namespace Nexus::rpc;
 using namespace std::chrono;
 
 // ============================================================================
