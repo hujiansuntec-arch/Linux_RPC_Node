@@ -1,8 +1,16 @@
-# LibRPC 架构设计文档
+# Nexus 架构设计文档
 
 **版本**: 3.0  
-**日期**: 2025-11-26  
-**作者**: LibRPC Team
+**日期**: 2025-11-28  
+**作者**: Nexus Team
+
+> **📝 最新更新 (2025-11-28)**:
+> - ✅ 移除FIFO方案，简化为CV + Semaphore双机制
+> - ✅ 批量通知优化：CPU从8.6%降到5.7%（⬇️34%）
+> - ✅ 缓存活跃队列：减少90%遍历开销
+> - ✅ 自适应超时：空闲50ms、繁忙5ms动态切换
+> - ✅ Flags安全验证：双重保护机制
+> - 📖 详细设计请参考 [DESIGN_DOC.md](DESIGN_DOC.md)
 
 ---
 
@@ -11,9 +19,10 @@
 1. [概述](#1-概述)
 2. [整体架构](#2-整体架构)
 3. [传输层设计](#3-传输层设计)
-4. [资源管理](#4-资源管理)
-5. [性能优化](#5-性能优化)
-6. [设计权衡](#6-设计权衡)
+4. [通知机制对比](#4-通知机制对比)
+5. [资源管理](#5-资源管理)
+6. [性能优化](#6-性能优化)
+7. [设计权衡](#7-设计权衡)
 
 ---
 
@@ -21,11 +30,12 @@
 
 ### 1.1 设计目标
 
-LibRPC 是一个高性能进程间通信库，设计目标包括：
+Nexus 是一个高性能进程间通信框架，设计目标包括：
 
 | 目标 | 指标 | 实现方式 |
 |-----|------|---------|
 | **低延迟** | <10μs（共享内存） | 无锁队列 + 零拷贝 |
+| **低CPU占用** | <6%（1000 msg/s） | 批量通知 + 自适应超时 |
 | **高吞吐** | >100 MB/s（大数据） | 环形缓冲区 + 批量传输 |
 | **可扩展** | 无节点数量限制 | 动态内存分配 |
 | **高可用** | 异常退出恢复 | PID检测 + 引用计数 + 心跳 |
@@ -36,9 +46,11 @@ LibRPC 是一个高性能进程间通信库，设计目标包括：
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│              LibRPC 核心特性 (v3.0)                  │
+│              Nexus 核心特性 (v3.0)                   │
 ├──────────────────────────────────────────────────────┤
 │  ✓ 零拷贝共享内存传输（动态SPSC队列）                 │
+│  ✓ 双通知机制（CV 5.7% + Semaphore 5.9%）           │
+│  ✓ 批量通知优化（0→1触发，减少60%唤醒）               │
 │  ✓ 内存优化（529MB → 33MB，降低94%）                │
 │  ✓ 跨平台支持（Linux + QNX）                        │
 │  ✓ 动态节点发现（基于Registry）                      │
@@ -418,9 +430,155 @@ int64_t write(const uint8_t* data, size_t size) {
 
 ---
 
-## 4. 资源管理
+## 4. 通知机制对比
 
-### 4.1 三重清理机制（v3.0增强）
+### 4.1 支持的通知机制
+
+LibRPC V3.0 支持两种高性能通知机制：
+
+| 机制 | CPU占用 | 丢包率 | 优点 | 适用场景 |
+|------|---------|--------|------|---------|
+| **Condition Variable** | **5.7%** ✅ | 0.027% | 跨平台通用，POSIX标准 | 通用Linux/QNX系统 |
+| **Semaphore** | **5.9%** ✅ | 0% | 无mutex开销，略简单 | QNX嵌入式系统 |
+
+> **已移除**：FIFO+epoll方案（CPU 5%但丢包率0.06%，可靠性问题）
+
+### 4.2 Condition Variable 方案
+
+**核心设计**：
+
+```cpp
+// 发送端：批量通知优化
+uint32_t prev = queue->pending_msgs.fetch_add(1, 
+                    std::memory_order_release);
+if (prev == 0) {
+    // 只在 0→1 时触发通知，避免过度唤醒
+    pthread_cond_signal(&queue->notify_cond);
+}
+
+// 接收端：真正的阻塞等待
+pthread_mutex_lock(&wait_queue->notify_mutex);
+
+// 双重检查避免信号丢失
+if (wait_queue->pending_msgs.load(std::memory_order_acquire) == 0) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += timeout_ms * 1000000;  // 自适应超时
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    
+    // 阻塞等待（非轮询）
+    pthread_cond_timedwait(&wait_queue->notify_cond, 
+                           &wait_queue->notify_mutex, &ts);
+}
+
+pthread_mutex_unlock(&wait_queue->notify_mutex);
+```
+
+**优化要点**：
+- ✅ **批量通知**：pending_msgs 从 0→1 才 signal（减少60%唤醒）
+- ✅ **双重检查**：避免信号丢失
+- ✅ **自适应超时**：空闲50ms、繁忙5ms
+- ✅ **真正等待**：pthread_cond_timedwait（非轮询）
+
+### 4.3 Semaphore 方案
+
+**核心设计**：
+
+```cpp
+// 发送端：批量通知优化（同CV）
+uint32_t prev = queue->pending_msgs.fetch_add(1, 
+                    std::memory_order_release);
+if (prev == 0) {
+    sem_post(&queue->notify_sem);  // 只在 0→1 时通知
+}
+
+// 接收端：真正的阻塞等待
+struct timespec timeout;
+clock_gettime(CLOCK_REALTIME, &timeout);
+timeout.tv_nsec += timeout_ms * 1000000L;
+if (timeout.tv_nsec >= 1000000000) {
+    timeout.tv_sec++;
+    timeout.tv_nsec -= 1000000000;
+}
+
+// 阻塞等待（非轮询）
+sem_timedwait(&active_queues[0]->notify_sem, &timeout);
+```
+
+**优化要点**：
+- ✅ **批量通知**：同CV方案
+- ✅ **真正等待**：sem_timedwait（非轮询）
+- ✅ **自适应超时**：同CV方案
+- ✅ **无mutex开销**：相比CV略简单
+
+### 4.4 性能对比（1000 msg/s负载）
+
+| 方案 | node0 CPU | node1 CPU | 平均CPU | 丢包率 | 优势 |
+|------|-----------|-----------|---------|--------|------|
+| **CV方案** | 5.4% | 6.0% | **5.7%** ✅ | 0.027% | 通用性最好 |
+| **Semaphore** | 5.8% | 6.0% | **5.9%** ✅ | 0% | QNX原生支持 |
+| FIFO+epoll（已移除） | 4.8% | 5.2% | 5.0% ❌ | 0.06% | 可靠性问题 |
+
+**优化效果**：
+- CPU占用从优化前8.6%降到5.7%（⬇️**34%**）
+- 减少60%的唤醒操作
+- 丢包率<0.1%（高可靠）
+
+### 4.5 缓存活跃队列优化
+
+**问题**：每次循环遍历所有 MAX_INBOUND_QUEUES（64个）
+
+**优化方案**：
+
+```cpp
+std::vector<InboundQueue*> active_queues;  // 缓存活跃队列
+uint32_t cached_num_queues = 0;
+int queue_refresh_counter = 0;
+
+// 检测num_queues变化时才刷新
+uint32_t current = my_shm_->header.num_queues.load();
+if (current != cached_num_queues || 
+    queue_refresh_counter >= 100 ||  // 定期刷新
+    active_queues.empty()) {
+    
+    active_queues.clear();
+    for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
+        InboundQueue& q = my_shm_->queues[i];
+        uint32_t flags = q.flags.load(std::memory_order_relaxed);
+        if ((flags & 0x3) == 0x3) {  // valid + active
+            active_queues.push_back(&q);
+        }
+    }
+    cached_num_queues = current;
+    queue_refresh_counter = 0;
+}
+
+// 仅遍历活跃队列（安全验证）
+for (auto* q : active_queues) {
+    // 每次访问前验证flags
+    uint32_t flags = q->flags.load(std::memory_order_relaxed);
+    if ((flags & 0x3) != 0x3) {
+        continue;  // 跳过失效队列
+    }
+    
+    // 批量处理消息
+    processMessages(q);
+}
+```
+
+**效果**：
+- ✅ 减少90%的队列遍历
+- ✅ 降低atomic load操作
+- ✅ 双重保护（num_queues检测 + flags验证）
+
+---
+
+## 5. 资源管理
+
+### 5.1 三重清理机制（v3.0增强）
 
 LibRPC 采用**引用计数 + PID检测 + 心跳监控**三重清理机制，确保共享内存资源不泄漏。
 

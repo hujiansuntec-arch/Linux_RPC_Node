@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 # 设置库路径
-export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH
 
 # 清理旧的共享内存
 echo "清理环境..."
@@ -36,12 +36,12 @@ for test in "${tests[@]}"; do
     echo ""
     
     # 启动接收端
-    ./test_large_receiver > /tmp/receiver.log 2>&1 &
+    ./build/test_large_receiver > /tmp/receiver.log 2>&1 &
     RECEIVER_PID=$!
     sleep 1
     
     # 运行发送端
-    ./test_large_sender $count $size 2>&1 | tee /tmp/sender.log | grep -E "(吞吐量|平均速度|耗时|成功)"
+    ./build/test_large_sender $count $size 2>&1 | tee /tmp/sender.log | grep -E "(吞吐量|平均速度|耗时|成功)"
     
     echo ""
     

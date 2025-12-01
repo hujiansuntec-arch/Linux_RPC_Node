@@ -25,15 +25,15 @@ echo "======================================"
 echo ""
 
 # 设置库路径
-export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH
 
 # 同时启动两个节点（后台）
 echo "启动 node0..."
-./test_duplex_v2 node0 node1 $DURATION $MSG_SIZE $RATE > /tmp/node0.log 2>&1 &
+./build/test_duplex_v2 node0 node1 $DURATION $MSG_SIZE $RATE > /tmp/node0.log 2>&1 &
 PID0=$!
 
 echo "启动 node1..."
-./test_duplex_v2 node1 node0 $DURATION $MSG_SIZE $RATE > /tmp/node1.log 2>&1 &
+./build/test_duplex_v2 node1 node0 $DURATION $MSG_SIZE $RATE > /tmp/node1.log 2>&1 &
 PID1=$!
 
 echo ""
