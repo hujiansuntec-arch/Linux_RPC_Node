@@ -34,7 +34,7 @@ SharedMemoryRegistry::~SharedMemoryRegistry() {
         for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
             uint32_t flags = registry_->entries[i].flags.load();
             if (flags & 0x1) {  // 有效节点
-                pid_t pid = registry_->entries[i].pid;
+                pid_t pid = registry_->entries[i].pid.load(std::memory_order_relaxed);
                 if (isProcessAlive(pid)) {
                     all_nodes_gone = false;
                     break;
@@ -111,11 +111,14 @@ bool SharedMemoryRegistry::initialize() {
         
         // Initialize all entries
         for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
-            registry_->entries[i].flags.store(0);
-            registry_->entries[i].node_id[0] = '\0';
-            registry_->entries[i].shm_name[0] = '\0';
-            registry_->entries[i].pid = 0;
-            registry_->entries[i].last_heartbeat.store(0);
+            registry_->entries[i].flags.store(0, std::memory_order_relaxed);
+            // 🔧 Initialize atomic string arrays to zero
+            for (int j = 0; j < 8; ++j) {
+                registry_->entries[i].node_id_atomic[j].store(0, std::memory_order_relaxed);
+                registry_->entries[i].shm_name_atomic[j].store(0, std::memory_order_relaxed);
+            }
+            registry_->entries[i].pid.store(0, std::memory_order_relaxed);
+            registry_->entries[i].last_heartbeat.store(0, std::memory_order_relaxed);
         }
         
         // 🔧 Memory barrier确保所有初始化完成后再设置magic
@@ -174,37 +177,61 @@ bool SharedMemoryRegistry::registerNode(const std::string& node_id, const std::s
     if (existing_idx >= 0) {
         // Update existing entry
         RegistryEntry& entry = registry_->entries[existing_idx];
-        strncpy(entry.shm_name, shm_name.c_str(), SHM_NAME_SIZE - 1);
-        entry.shm_name[SHM_NAME_SIZE - 1] = '\0';
-        entry.pid = getpid();
-        entry.last_heartbeat.store(getCurrentTimeMs());
-        entry.flags.store(0x3);  // valid | active
+        
+        // 🔧 Write using atomic operations for cross-process safety
+        writeAtomicString(entry.shm_name_atomic, shm_name, SHM_NAME_SIZE);
+        entry.pid.store(getpid(), std::memory_order_seq_cst);
+        uint64_t update_ts = getCurrentTimeMs();
+        entry.last_heartbeat.store(update_ts, std::memory_order_seq_cst);
+        NEXUS_LOG_INFO("Registry", "[TIMESTAMP] registerNode (update): " + node_id + " updated_hb=" + std::to_string(update_ts) + "ms");
+        
+        // 🔧 Finally set flags to indicate entry is valid
+        entry.flags.store(0x3, std::memory_order_seq_cst);  // valid | active
         
         NEXUS_LOG_INFO("Registry", "Updated node: " + node_id + " -> " + shm_name);
         return true;
     }
     
-    // Find free entry
-    int idx = findFreeEntryIndex();
+    // 🔧 CRITICAL: Atomically claim a free entry using CAS to prevent race conditions
+    // Multiple processes may call registerNode() concurrently during startup
+    // Without atomic allocation, they could get the same index and overwrite each other
+    int idx = -1;
+    for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
+        uint32_t expected = 0;  // Free entry (flags == 0)
+        uint32_t desired = 0x1;  // Claim it (valid bit set, but not active yet)
+        
+        // Try to atomically claim this entry
+        if (registry_->entries[i].flags.compare_exchange_strong(
+                expected, desired, std::memory_order_acq_rel)) {
+            idx = static_cast<int>(i);
+            break;
+        }
+    }
+    
     if (idx < 0) {
         NEXUS_LOG_ERROR("Registry", "Registry full (max " + std::to_string(MAX_REGISTRY_ENTRIES) + " nodes)");
         return false;
     }
     
-    // Register new node
+    // Register new node (we now have exclusive ownership of this entry)
     RegistryEntry& entry = registry_->entries[idx];
-    strncpy(entry.node_id, node_id.c_str(), NODE_ID_SIZE - 1);
-    entry.node_id[NODE_ID_SIZE - 1] = '\0';
-    strncpy(entry.shm_name, shm_name.c_str(), SHM_NAME_SIZE - 1);
-    entry.shm_name[SHM_NAME_SIZE - 1] = '\0';
-    entry.pid = getpid();
-    entry.last_heartbeat.store(getCurrentTimeMs());
-    entry.flags.store(0x3);  // valid | active
     
-    registry_->header.num_entries.fetch_add(1);
+    // 🔧 CRITICAL: Write all fields using atomic operations for cross-process safety
+    writeAtomicString(entry.node_id_atomic, node_id, NODE_ID_SIZE);
+    writeAtomicString(entry.shm_name_atomic, shm_name, SHM_NAME_SIZE);
+    entry.pid.store(getpid(), std::memory_order_seq_cst);
+    uint64_t init_ts = getCurrentTimeMs();
+    entry.last_heartbeat.store(init_ts, std::memory_order_seq_cst);
+    NEXUS_LOG_INFO("Registry", "[TIMESTAMP] registerNode (new): " + node_id + " initial_hb=" + std::to_string(init_ts) + "ms");
+    
+    // 🔧 CRITICAL: Set flags last to publish the entry atomically
+    entry.flags.store(0x3, std::memory_order_seq_cst);  // valid | active
+    
+    // 🔧 Update num_entries with release so other processes see the new entry
+    registry_->header.num_entries.fetch_add(1, std::memory_order_release);
     
     NEXUS_LOG_INFO("Registry", "Registered node: " + node_id + " -> " + shm_name + 
-                  " (total: " + std::to_string(registry_->header.num_entries.load()) + ")");
+                  " (total: " + std::to_string(registry_->header.num_entries.load(std::memory_order_acquire)) + ")");
     
     return true;
 }
@@ -221,13 +248,21 @@ bool SharedMemoryRegistry::unregisterNode(const std::string& node_id) {
     
     // Clear entry
     RegistryEntry& entry = registry_->entries[idx];
-    entry.flags.store(0);
-    entry.node_id[0] = '\0';
-    entry.shm_name[0] = '\0';
-    entry.pid = 0;
-    entry.last_heartbeat.store(0);
     
-    registry_->header.num_entries.fetch_sub(1);
+    // 🔧 CRITICAL: Decrement with release to ensure visibility
+    registry_->header.num_entries.fetch_sub(1, std::memory_order_release);
+    
+    // 🔧 Clear flags with seq_cst to prevent other processes from seeing this entry
+    entry.flags.store(0, std::memory_order_seq_cst);
+    
+    // 🔧 Now safe to clear other atomic fields (no one can see this entry anymore)
+    // Use release to ensure visibility of the clear operation
+    for (int j = 0; j < 8; ++j) {
+        entry.node_id_atomic[j].store(0, std::memory_order_release);
+        entry.shm_name_atomic[j].store(0, std::memory_order_release);
+    }
+    entry.pid.store(0, std::memory_order_release);
+    entry.last_heartbeat.store(0, std::memory_order_release);
     
     NEXUS_LOG_INFO("Registry", "Unregistered node: " + node_id + 
                   " (remaining: " + std::to_string(registry_->header.num_entries.load()) + ")");
@@ -245,7 +280,10 @@ bool SharedMemoryRegistry::updateHeartbeat(const std::string& node_id) {
         return false;
     }
     
-    registry_->entries[idx].last_heartbeat.store(getCurrentTimeMs());
+    // 🔧 使用seq_cst确保心跳时间戳立即对其他进程可见
+    uint64_t hb_ts = getCurrentTimeMs();
+    registry_->entries[idx].last_heartbeat.store(hb_ts, std::memory_order_seq_cst);
+    NEXUS_LOG_INFO("Registry", "[TIMESTAMP] updateHeartbeat: " + node_id + " hb=" + std::to_string(hb_ts) + "ms");
     return true;
 }
 
@@ -258,17 +296,19 @@ std::vector<NodeInfo> SharedMemoryRegistry::getAllNodes() const {
     
     for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
         const RegistryEntry& entry = registry_->entries[i];
-        uint32_t flags = entry.flags.load();
+        // 🔧 Use seq_cst for shared memory visibility
+        uint32_t flags = entry.flags.load(std::memory_order_seq_cst);
         
         if ((flags & 0x1) == 0) {  // Not valid
             continue;
         }
         
+        // 🔧 Read all fields atomically
         NodeInfo info;
-        info.node_id = entry.node_id;
-        info.shm_name = entry.shm_name;
-        info.pid = entry.pid;
-        info.last_heartbeat = entry.last_heartbeat.load();
+        info.node_id = readAtomicString(entry.node_id_atomic, NODE_ID_SIZE);
+        info.shm_name = readAtomicString(entry.shm_name_atomic, SHM_NAME_SIZE);
+        info.pid = entry.pid.load(std::memory_order_seq_cst);
+        info.last_heartbeat = entry.last_heartbeat.load(std::memory_order_seq_cst);
         info.active = (flags & 0x2) != 0;
         
         nodes.push_back(info);
@@ -288,11 +328,13 @@ bool SharedMemoryRegistry::findNode(const std::string& node_id, NodeInfo& info) 
     }
     
     const RegistryEntry& entry = registry_->entries[idx];
-    info.node_id = entry.node_id;
-    info.shm_name = entry.shm_name;
-    info.pid = entry.pid;
-    info.last_heartbeat = entry.last_heartbeat.load();
-    info.active = (entry.flags.load() & 0x2) != 0;
+    
+    // 🔧 Read all fields atomically
+    info.node_id = readAtomicString(entry.node_id_atomic, NODE_ID_SIZE);
+    info.shm_name = readAtomicString(entry.shm_name_atomic, SHM_NAME_SIZE);
+    info.pid = entry.pid.load(std::memory_order_seq_cst);
+    info.last_heartbeat = entry.last_heartbeat.load(std::memory_order_seq_cst);
+    info.active = (entry.flags.load(std::memory_order_seq_cst) & 0x2) != 0;
     
     return true;
 }
@@ -307,7 +349,8 @@ bool SharedMemoryRegistry::nodeExists(const std::string& node_id) const {
         return false;
     }
     
-    uint32_t flags = registry_->entries[idx].flags.load();
+    // 🔧 使用acquire读取flags
+    uint32_t flags = registry_->entries[idx].flags.load(std::memory_order_acquire);
     return (flags & 0x3) == 0x3;  // valid && active
 }
 
@@ -321,27 +364,71 @@ int SharedMemoryRegistry::cleanupStaleNodes(uint64_t timeout_ms) {
     
     for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
         RegistryEntry& entry = registry_->entries[i];
-        uint32_t flags = entry.flags.load();
+        // 🔧 Use seq_cst to see latest flags
+        uint32_t flags = entry.flags.load(std::memory_order_seq_cst);
         
         if ((flags & 0x1) == 0) {  // Not valid
             continue;
         }
         
-        uint64_t last_hb = entry.last_heartbeat.load();
-        bool timeout = (now - last_hb) > timeout_ms;
-        bool process_dead = !isProcessAlive(entry.pid);
+        // 🔧 Read pid and heartbeat atomically
+        pid_t pid = entry.pid.load(std::memory_order_seq_cst);
+        uint64_t last_hb = entry.last_heartbeat.load(std::memory_order_seq_cst);
+        
+        // 🔧 CRITICAL: Skip entries being initialized (last_hb == 0)
+        // During concurrent registration with CAS, an entry may have valid bit set
+        // but other fields (node_id, pid, last_hb) are still being written
+        // Wait until initialization is complete before checking timeout
+        if (last_hb == 0) {
+            continue;  // Entry is being initialized, skip it
+        }
+        
+        // 🔧 CRITICAL: Safe time difference calculation to handle clock skew
+        // system_clock may have slight differences across processes (microsecond level)
+        // If now < last_hb (clock skew), treat as 0 instead of uint64 underflow
+        uint64_t time_since_hb = 0;
+        if (now >= last_hb) {
+            time_since_hb = now - last_hb;
+        } else {
+            // Clock skew: our clock is behind the node's clock
+            // This is normal due to system_clock precision limits across processes
+            // Treat as fresh heartbeat (time_since = 0)
+            time_since_hb = 0;
+        }
+        
+        bool timeout = time_since_hb > timeout_ms;
+        bool process_dead = !isProcessAlive(pid);
         
         if (timeout || process_dead) {
-            NEXUS_LOG_INFO("Registry", "Cleaning stale node: " + std::string(entry.node_id) + 
-                          (timeout ? " (timeout)" : " (process dead)"));
+            // Read node_id for logging
+            std::string node_id_str = readAtomicString(entry.node_id_atomic, NODE_ID_SIZE);
             
-            entry.flags.store(0);
-            entry.node_id[0] = '\0';
-            entry.shm_name[0] = '\0';
-            entry.pid = 0;
-            entry.last_heartbeat.store(0);
+            // 🔧 详细日志：显示心跳时间差，帮助诊断
+            std::string reason;
+            if (timeout) {
+                reason = " (timeout: last_hb=" + std::to_string(last_hb) + 
+                        "ms, now=" + std::to_string(now) + 
+                        "ms, diff=" + std::to_string(time_since_hb) + 
+                        "ms > " + std::to_string(timeout_ms) + "ms)";
+            } else {
+                reason = " (process dead)";
+            }
+            NEXUS_LOG_INFO("Registry", "Cleaning stale node: " + node_id_str + reason);
             
-            registry_->header.num_entries.fetch_sub(1);
+            // 🔧 CRITICAL: Clear flags FIRST to invalidate entry
+            entry.flags.store(0, std::memory_order_seq_cst);
+            
+            // 🔧 Clear other atomic fields (use release for visibility)
+            entry.pid.store(0, std::memory_order_release);
+            entry.last_heartbeat.store(0, std::memory_order_release);
+            for (size_t j = 0; j < 8; ++j) {
+                entry.node_id_atomic[j].store(0, std::memory_order_release);
+                entry.shm_name_atomic[j].store(0, std::memory_order_release);
+            }
+            
+            // 🔧 Decrement count (use release)
+            registry_->header.num_entries.fetch_sub(1, std::memory_order_release);
+            
             cleaned++;
         }
     }
@@ -354,7 +441,8 @@ int SharedMemoryRegistry::getActiveNodeCount() const {
         return 0;
     }
     
-    return registry_->header.num_entries.load();
+    // 🔧 Use acquire to see latest count updates
+    return registry_->header.num_entries.load(std::memory_order_acquire);
 }
 
 bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
@@ -381,7 +469,7 @@ bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
         // Registry is valid, check if any process is alive
         bool has_alive = false;
         for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
-            uint32_t flags = reg->entries[i].flags.load(std::memory_order_acquire);
+            uint32_t flags = reg->entries[i].flags.load(std::memory_order_seq_cst);
             if ((flags & 0x1)) {
                 pid_t pid = reg->entries[i].pid;
                 // 检查进程是否存活
@@ -416,7 +504,17 @@ bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
 int SharedMemoryRegistry::findEntryIndex(const std::string& node_id) const {
     for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
         const RegistryEntry& entry = registry_->entries[i];
-        if ((entry.flags.load() & 0x1) && strcmp(entry.node_id, node_id.c_str()) == 0) {
+        // 🔧 For shared memory across processes, use seq_cst for cache coherence
+        uint32_t flags = entry.flags.load(std::memory_order_seq_cst);
+        
+        if ((flags & 0x1) == 0) {  // Not valid
+            continue;
+        }
+        
+        // 🔧 Read node_id atomically
+        std::string entry_node_id = readAtomicString(entry.node_id_atomic, NODE_ID_SIZE);
+        
+        if (entry_node_id == node_id) {
             return static_cast<int>(i);
         }
     }
@@ -425,7 +523,8 @@ int SharedMemoryRegistry::findEntryIndex(const std::string& node_id) const {
 
 int SharedMemoryRegistry::findFreeEntryIndex() const {
     for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
-        if ((registry_->entries[i].flags.load() & 0x1) == 0) {
+        // 🔧 Use seq_cst for shared memory visibility
+        if ((registry_->entries[i].flags.load(std::memory_order_seq_cst) & 0x1) == 0) {
             return static_cast<int>(i);
         }
     }
@@ -433,7 +532,10 @@ int SharedMemoryRegistry::findFreeEntryIndex() const {
 }
 
 uint64_t SharedMemoryRegistry::getCurrentTimeMs() const {
-    auto now = std::chrono::steady_clock::now();
+    // 🔧 CRITICAL: Use system_clock instead of steady_clock for cross-process timestamps
+    // steady_clock is process-local and can have different epoch for each process
+    // system_clock provides wall-clock time that is consistent across all processes
+    auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
     return ms.count();
 }
@@ -443,6 +545,37 @@ bool SharedMemoryRegistry::isProcessAlive(pid_t pid) const {
         return false;
     }
     return kill(pid, 0) == 0;
+}
+
+// 🔧 Atomic string helpers for cross-process safe string storage
+void SharedMemoryRegistry::writeAtomicString(std::atomic<uint64_t>* atomic_array, const std::string& str, size_t max_bytes) {
+    // Convert string to uint64_t chunks and write atomically
+    const size_t num_chunks = max_bytes / sizeof(uint64_t);
+    char buffer[max_bytes];
+    std::memset(buffer, 0, max_bytes);
+    std::strncpy(buffer, str.c_str(), max_bytes - 1);
+    
+    // Write each 8-byte chunk atomically with seq_cst for immediate visibility
+    for (size_t i = 0; i < num_chunks; ++i) {
+        uint64_t chunk;
+        std::memcpy(&chunk, buffer + i * sizeof(uint64_t), sizeof(uint64_t));
+        atomic_array[i].store(chunk, std::memory_order_seq_cst);
+    }
+}
+
+std::string SharedMemoryRegistry::readAtomicString(const std::atomic<uint64_t>* atomic_array, size_t max_bytes) {
+    // Read uint64_t chunks atomically and convert to string
+    const size_t num_chunks = max_bytes / sizeof(uint64_t);
+    char buffer[max_bytes];
+    
+    // Read each 8-byte chunk atomically with seq_cst
+    for (size_t i = 0; i < num_chunks; ++i) {
+        uint64_t chunk = atomic_array[i].load(std::memory_order_seq_cst);
+        std::memcpy(buffer + i * sizeof(uint64_t), &chunk, sizeof(uint64_t));
+    }
+    
+    buffer[max_bytes - 1] = '\0';  // Ensure null termination
+    return std::string(buffer);
 }
 
 } // namespace rpc

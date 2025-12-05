@@ -19,10 +19,12 @@
 1. [概述](#1-概述)
 2. [整体架构](#2-整体架构)
 3. [传输层设计](#3-传输层设计)
-4. [通知机制对比](#4-通知机制对比)
-5. [资源管理](#5-资源管理)
-6. [性能优化](#6-性能优化)
-7. [设计权衡](#7-设计权衡)
+4. [Node注册与连接](#4-node注册与连接)
+5. [服务发现机制](#5-服务发现机制)
+6. [通知机制对比](#6-通知机制对比)
+7. [资源管理](#7-资源管理)
+8. [性能优化](#8-性能优化)
+9. [设计权衡](#9-设计权衡)
 
 ---
 
@@ -576,7 +578,308 @@ for (auto* q : active_queues) {
 
 ---
 
-## 5. 资源管理
+## 4. Node注册与连接
+
+### 4.1 Registry架构
+
+**SharedMemoryRegistry** 是全局节点注册表，所有跨进程节点共享。
+
+```
+┌─────────────────────────────────────────────────────┐
+│        /dev/shm/librpc_registry (共享内存)          │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐ │
+│  │  Header                                        │ │
+│  │  • magic: 0x4C525247 ("LRRG")                 │ │
+│  │  • version: 1                                  │ │
+│  │  • num_entries: 当前节点数                     │ │
+│  │  • capacity: 256 (最大节点数)                  │ │
+│  └────────────────────────────────────────────────┘ │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐ │
+│  │  RegistryEntry[0]                              │ │
+│  │  • node_id: "node_18f2a3b4c5d6"               │ │
+│  │  • shm_name: "/librpc_node_12345_abc123"      │ │
+│  │  • pid: 12345                                  │ │
+│  │  • last_heartbeat: timestamp                   │ │
+│  │  • flags: valid | active                       │ │
+│  └────────────────────────────────────────────────┘ │
+│  │  RegistryEntry[1]                              │ │
+│  │  ...                                           │ │
+│  │  RegistryEntry[255]                            │ │
+│  └────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+**Registry的三个作用**：
+1. **Node发现**：新节点启动时查询现有节点
+2. **心跳维护**：每500ms更新心跳，清理过期节点（>3s）
+3. **连接查找**：发送消息时查询目标节点的共享内存名称
+
+### 4.2 Node注册流程
+
+```
+Node启动流程：
+
+1. 创建自己的NodeSharedMemory
+   ├─ 名称: /librpc_node_<PID>_<HASH>
+   ├─ 大小: 33MB (默认32队列)
+   └─ 初始化: Header + InboundQueue[0-31]
+
+2. 注册到Registry
+   ├─ 打开/创建 /librpc_registry
+   ├─ 查找空闲slot
+   └─ 写入: node_id, shm_name, pid, heartbeat
+
+3. 设置ready标志
+   └─ ready.store(true) // 允许其他节点连接
+
+4. 启动后台线程
+   ├─ receiveLoop: 接收消息
+   └─ heartbeatLoop: 更新心跳 + 清理过期节点
+```
+
+**Registry初始化的原子性保证**：
+
+```cpp
+// 创建者（第一个进程）
+int fd = shm_open("/librpc_registry", O_CREAT | O_EXCL | O_RDWR, 0666);
+// ... 初始化所有字段 ...
+registry->header.magic.store(0x4C525247, std::memory_order_release);
+
+// 读取者（后续进程）
+int retry = 0;
+while (retry < 10) {
+    uint32_t magic = registry->header.magic.load(std::memory_order_acquire);
+    if (magic == 0x4C525247) break;  // 验证成功
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));  // 重试
+    retry++;
+}
+```
+
+**关键设计**：
+- ✅ O_EXCL原子创建（只有一个进程创建成功）
+- ✅ Release-Acquire语义（确保初始化顺序）
+- ✅ 重试机制（避免初始化窗口期的"Invalid magic"错误）
+
+### 4.3 Node连接机制（懒惰连接）
+
+Node之间的连接是**懒惰建立**的，即**首次发送消息时**才建立连接。
+
+```
+连接建立流程（Node A → Node B）：
+
+1. Node A首次发送消息给Node B
+   └─ send("node_B", data, size)
+
+2. 检查连接缓存
+   └─ remote_connections_.find("node_B") → 未找到
+
+3. 从Registry查询Node B信息
+   ├─ registry_.findNode("node_B", target_info)
+   └─ 获取: shm_name = "/librpc_node_67890_def456"
+
+4. 打开并映射Node B的共享内存
+   ├─ shm_fd = shm_open(target_info.shm_name, O_RDWR, 0666)
+   └─ shm_ptr = mmap(nullptr, sizeof(NodeSharedMemory), ...)
+
+5. 验证Node B已就绪
+   ├─ magic == 0x4C525247 ✓
+   └─ ready == true ✓
+
+6. 在Node B的共享内存中分配入站队列
+   ├─ 查找空闲队列slot
+   ├─ 原子占用: flags.compare_exchange_strong(0, 0x3)
+   ├─ 初始化: sender_id = "node_A"
+   └─ 初始化同步原语: pthread_cond 或 semaphore
+
+7. 缓存连接信息
+   └─ remote_connections_["node_B"] = {shm_ptr, my_queue, ...}
+
+8. 发送消息
+   └─ my_queue->queue.tryWrite(data, size)
+```
+
+**连接关系示意图**：
+
+```
+Node A                          Node B
+┌─────────────────┐            ┌─────────────────┐
+│ NodeSharedMemory│            │ NodeSharedMemory│
+│ queues[0-31]    │            │ queues[0-31]    │
+│   [0]: ← B ─────│◄───────┐   │   [0]: ← A     │
+│   [1]: ← C      │        │   │   [1]: free    │
+└─────────────────┘        │   └─────────────────┘
+                           │            ▲
+RemoteConnection to B      │            │
+├─ shm_ptr: → B的共享内存  │            │
+└─ my_queue: &B.queues[0]──┘            │
+                                        │
+RemoteConnection to A                   │
+├─ shm_ptr: → A的共享内存              │
+└─ my_queue: &A.queues[0]───────────────┘
+```
+
+**关键优化**：
+- ✅ **懒惰连接**：不预先建立所有连接，降低启动开销
+- ✅ **连接缓存**：Fast Path直接查表，Slow Path才建立连接
+- ✅ **双向独立**：A→B和B→A使用不同队列，互不干扰
+- ✅ **原子分配**：CAS确保队列slot不冲突
+
+### 4.4 Node发现机制
+
+Node发现**不通过定期扫描Registry**，而是通过以下机制：
+
+#### 4.4.1 启动时主动查询
+
+```cpp
+void NodeImpl::initialize() {
+    // 1. 注册到Registry
+    shm_transport_v3_->initialize(node_id_);
+    
+    // 2. 查询现有服务（触发连接建立）
+    queryRemoteServices();  // 广播空的SERVICE_REGISTER消息
+    
+    // 3. 广播NODE_JOIN事件
+    broadcastNodeEvent(true);
+}
+```
+
+**查询流程**：
+```
+Node A启动
+   ↓
+queryRemoteServices() 
+   ↓
+广播空SERVICE_REGISTER (payload_len=0)
+   ↓
+Node B/C收到查询 → 回复自己的服务列表
+   ↓
+Node A收到回复 → 自动建立连接（懒惰连接触发）
+```
+
+#### 4.4.2 心跳超时检测
+
+```cpp
+void SharedMemoryTransportV3::heartbeatLoop() {
+    while (running_) {
+        // 1. 更新自己的心跳
+        registry_.updateHeartbeat(node_id_);
+        
+        // 2. 清理过期节点（>3秒无心跳）
+        std::vector<NodeInfo> nodes_before = registry_.getAllNodes();
+        int cleaned = registry_.cleanupStaleNodes(3000);
+        
+        // 3. 对比找出被删除的节点，触发NODE_LEFT事件
+        if (cleaned > 0) {
+            auto nodes_after = registry_.getAllNodes();
+            for (const auto& node : nodes_before) {
+                if (!existsIn(node, nodes_after)) {
+                    node_impl_->handleNodeEvent(node.node_id, false);
+                }
+            }
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+```
+
+**效果**：
+- ✅ 崩溃节点2-5秒内自动发现并清理
+- ✅ 自动触发NODE_LEFT事件
+- ✅ 服务发现自动更新
+
+---
+
+## 5. 服务发现机制
+
+### 5.1 两层服务注册表
+
+```
+┌─────────────────────────────────────────────────────┐
+│         GlobalRegistry (进程内，单例)               │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ nodes_: map<node_id, NodeImpl>               │  │
+│  │ services_: map<group, vector<ServiceDesc>>   │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+         ▲                               ▲
+         │                               │
+    ┌────┴────┐                    ┌────┴────┐
+    │ Node A  │                    │ Node B  │
+    │(进程内) │                    │(进程内) │
+    └─────────┘                    └─────────┘
+         │                               │
+         │   SharedMemory消息传输         │
+         └───────────────────────────────┘
+           SERVICE_REGISTER / UNREGISTER
+```
+
+**设计原则**：
+- ✅ **进程内**：用GlobalRegistry（内存，快速）
+- ✅ **跨进程**：用消息广播（SharedMemory传输）
+- ✅ **无中心化**：不依赖单点服务注册中心
+
+### 5.2 服务注册流程
+
+```
+Node A注册服务 "sensor/temperature"：
+
+1. 注册到GlobalRegistry（进程内）
+   └─ GlobalRegistry::instance().registerService("sensor", svc)
+
+2. 通知进程内其他节点（同步）
+   └─ for each node in process:
+        node->handleServiceUpdate(svc, true)
+
+3. 广播到远程节点（异步）
+   ├─ 序列化服务描述
+   ├─ 构建SERVICE_REGISTER消息
+   └─ shm_transport_v3_->broadcast(packet)
+```
+
+### 5.3 服务发现流程
+
+```
+Node B查询服务：
+
+方式1: 主动查询（启动时）
+   ├─ queryRemoteServices()
+   ├─ 广播空SERVICE_REGISTER (payload_len=0)
+   └─ 其他节点收到 → 回复所有服务
+
+方式2: 被动接收（运行时）
+   ├─ 收到SERVICE_REGISTER消息
+   ├─ 解析服务描述
+   └─ 更新GlobalRegistry
+
+方式3: 订阅通知（实时）
+   ├─ subscribe("sensor", "temperature", callback)
+   ├─ 广播SUBSCRIBE消息
+   └─ 发布者自动推送更新
+```
+
+### 5.4 与共享内存的关系
+
+| 机制 | 使用的共享内存 | 传输方式 |
+|-----|--------------|---------|
+| **Node注册** | `/librpc_registry` | 直接写入Registry |
+| **Node发现** | 查询Registry + 心跳检测 | atomic load |
+| **Node连接** | `/librpc_node_PID_HASH` | mmap映射 |
+| **服务注册** | GlobalRegistry（进程内） | 内存 |
+| **服务同步** | SharedMemory传输 | InboundQueue |
+| **消息传输** | InboundQueue (SPSC) | 无锁队列 |
+
+**关键设计**：
+- ✅ **Registry轻量**：仅存储Node元信息，不存储服务数据
+- ✅ **服务同步**：通过消息广播，避免中心化瓶颈
+- ✅ **懒惰连接**：首次发送时才映射对方共享内存
+- ✅ **双向独立**：每个方向独立的SPSC队列
+
+---
+
+## 6. 通知机制对比
 
 ### 5.1 三重清理机制（v3.0增强）
 
@@ -614,7 +917,7 @@ LibRPC 采用**引用计数 + PID检测 + 心跳监控**三重清理机制，确
               └────────────────┘
 ```
 
-### 4.2 引用计数清理
+### 7.2 引用计数清理
 
 **适用场景**：正常退出（exit, return, SIGTERM）
 
@@ -649,7 +952,7 @@ class LargeDataChannel {
 - ✅ 多进程场景，最后退出的进程负责清理
 - ❌ 异常退出（kill -9）时无法执行
 
-### 4.3 心跳超时清理（v3.0新增）
+### 7.3 心跳超时清理（v3.0新增）
 
 **适用场景**：进程崩溃、kill -9（快速检测）
 
@@ -688,7 +991,7 @@ void SharedMemoryTransportV3::heartbeatLoop() {
 - ✅ 无需重启进程
 - ✅ 自动触发服务发现更新
 
-### 4.4 PID检测清理
+### 7.4 PID检测清理
 
 **适用场景**：异常退出（kill -9, 崩溃）后重启
 
@@ -766,7 +1069,7 @@ static bool isProcessAlive(int32_t pid) {
 - ✅ 精确判断（PID检测）
 - ✅ 性能优化（目录扫描，非暴力尝试）
 
-### 4.5 清理性能对比（v3.0）
+### 7.5 清理性能对比（v3.0）
 
 | 方法 | 延迟 | 准确性 | 操作次数 | 应用场景 |
 |-----|------|--------|---------|---------|
@@ -776,9 +1079,9 @@ static bool isProcessAlive(int32_t pid) {
 
 ---
 
-## 5. 性能优化
+## 8. 性能优化
 
-### 5.1 无锁队列
+### 8.1 无锁队列
 
 **SPSC队列**（Single Producer Single Consumer）：
 
@@ -816,7 +1119,7 @@ public:
 - ✅ Memory order优化（relaxed/acquire/release）
 - ✅ 单生产者单消费者（无竞争）
 
-### 5.2 零拷贝
+### 8.2 零拷贝
 
 **传统方式**（2次拷贝）：
 ```cpp
@@ -841,7 +1144,7 @@ channel->releaseBlock(block);
 - 1MB数据：省略2MB拷贝 → **2倍性能**
 - 4MB数据：省略8MB拷贝 → **2倍性能**
 
-### 5.3 MAP_NORESERVE 优化（Linux）
+### 8.3 MAP_NORESERVE 优化（Linux）
 
 **问题**：64MB共享内存立即分配64MB物理内存
 
@@ -864,7 +1167,7 @@ void* addr = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
 - 节省内存：未使用部分不占用物理RAM
 - **QNX差异**：立即分配物理内存
 
-### 5.4 Cache Line对齐
+### 8.4 Cache Line对齐
 
 ```cpp
 // ✅ Cache line对齐（64字节）
@@ -888,9 +1191,9 @@ struct alignas(64) InboundQueue {
 
 ---
 
-## 6. 设计权衡
+## 9. 设计权衡
 
-### 6.1 内存占用 vs 队列容量
+### 9.1 内存占用 vs 队列容量
 
 **v3.0选择**：配置化队列参数
 
@@ -902,7 +1205,7 @@ struct alignas(64) InboundQueue {
 
 **理由**：不同场景需求不同，提供配置化选项。
 
-### 6.2 心跳 vs PID检测
+### 9.2 心跳 vs PID检测
 
 **v3.0选择**：心跳 + PID（互补）
 
@@ -917,7 +1220,7 @@ struct alignas(64) InboundQueue {
 - PID提供启动时清理（快速恢复）
 - 两者互补，覆盖所有场景
 
-### 6.3 多读者 vs 单读者
+### 9.3 多读者 vs 单读者
 
 **v3.0选择**：单读者（SPSC）
 
@@ -929,7 +1232,7 @@ struct alignas(64) InboundQueue {
 
 **理由**：大部分场景是点对点或发布-订阅（多个SPSC），无需MPMC。
 
-### 6.4 CRC32 vs 无校验
+### 9.4 CRC32 vs 无校验
 
 **v3.0选择**：CRC32校验
 

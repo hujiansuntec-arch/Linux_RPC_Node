@@ -208,6 +208,20 @@ void NodeImpl::initialize(uint16_t udp_port) {
             // Subscriptions are synchronized via SUBSCRIBE broadcast messages
             // This eliminates ~70% of startup messages and speeds up initialization
             
+            // 🔧 CRITICAL: Proactively connect to all existing nodes in registry
+            // This solves the race condition where concurrent node startups miss each other
+            // because registry writes happen out of order with NODE_JOIN broadcasts
+            auto existing_nodes = shm_transport_v3_->getLocalNodes();
+            for (const auto& node_id : existing_nodes) {
+                if (node_id != node_id_) {
+                    NEXUS_DEBUG("IMPL") << "Proactively connecting to existing node: " << node_id;
+                    // This will trigger lazy connection and queue creation
+                    // Send empty message just to establish connection
+                    std::vector<uint8_t> dummy(1, 0);
+                    shm_transport_v3_->send(node_id, dummy.data(), 0);
+                }
+            }
+            
             // Query existing services from other nodes (cross-process service discovery)
             queryRemoteServices();
             
@@ -1197,7 +1211,7 @@ void NodeImpl::queryRemoteServices() {
 
     // Note: No sleep here - let the receive loop handle incoming service registrations
     // The test application should wait before starting to send data messages
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
 void NodeImpl::registerService(const ServiceDescriptor& svc) {
@@ -1266,23 +1280,7 @@ void NodeImpl::handleNodeEvent(const std::string& from_node, bool is_joined) {
     // Notify all listeners in this node
     notifyNodeEvent(event, from_node);
     
-    if (is_joined) {
-        // 🔧 FIX: When a new node joins, actively query its services
-        // This triggers lazy connection establishment immediately
-        // Without this, early-started nodes won't connect to late-started nodes
-        // until they passively receive a message (which may take 10+ seconds)
-        NEXUS_DEBUG("IMPL") << "Proactively querying services from new node: " << from_node;
-        
-        // Send a query to the new node (empty SERVICE_REGISTER message)
-        std::vector<uint8_t> query_packet = MessageBuilder::build(
-            node_id_, "", "", nullptr, 0, 0, MessageType::SERVICE_REGISTER);
-        
-        // Send directly to the new node (this will trigger lazy connection)
-        if (shm_transport_v3_) {
-            bool sent = shm_transport_v3_->send(from_node, query_packet.data(), query_packet.size());
-            NEXUS_DEBUG("IMPL") << "Query sent to " << from_node << ": " << (sent ? "SUCCESS" : "FAILED");
-        }
-    } else {
+    if (!is_joined) {
         // Node left: Clean up its services from global registry
         // For cross-process nodes, we need to manually clean up services
         // because GlobalRegistry doesn't know about remote node disconnections

@@ -36,12 +36,12 @@ for test in "${tests[@]}"; do
     echo ""
     
     # 启动接收端
-    ./build/test_large_receiver > /tmp/receiver.log 2>&1 &
+    ./build/test_large_receiver > ./tmp/receiver.log 2>&1 &
     RECEIVER_PID=$!
     sleep 1
     
     # 运行发送端
-    ./build/test_large_sender $count $size 2>&1 | tee /tmp/sender.log | grep -E "(吞吐量|平均速度|耗时|成功)"
+    ./build/test_large_sender $count $size 2>&1 | tee ./tmp/sender.log | grep -E "(吞吐量|平均速度|耗时|成功)"
     
     echo ""
     
@@ -50,7 +50,7 @@ for test in "${tests[@]}"; do
     sleep 1
     
     # 显示接收端统计
-    cat /tmp/receiver.log | grep -A 10 "接收统计" | head -12
+    cat ./tmp/receiver.log | grep -A 10 "接收统计" | head -12
     
     echo ""
     echo "--------------------------------------"

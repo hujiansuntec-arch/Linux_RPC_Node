@@ -191,27 +191,29 @@ public:
     
 private:
     // Inbound queue (receiving from a sender)
+    // 🔧 双队列架构：控制面与数据面分离
     struct InboundQueue {
-        char sender_id[64];
+        // 🔧 Store sender_id as atomic uint64_t array for true atomicity (64 bytes = 8 * uint64_t)
+        std::atomic<uint64_t> sender_id_atomic[8];
         std::atomic<uint32_t> flags;  // Bit 0: valid, Bit 1: active
         
-        // 🔧 跨进程事件通知：支持两种机制
-        // 方案1: Condition Variable (CV)
-        pthread_mutex_t notify_mutex;     // CV: 保护条件变量的互斥锁
-        pthread_cond_t notify_cond;       // CV: 条件变量
-        std::atomic<uint32_t> pending_msgs;  // CV/SEM: 待处理消息计数（优化批处理）
+        // 🔧 控制队列（高优先级）：NODE_JOIN, SERVICE_REGISTER等
+        std::atomic<uint32_t> control_pending;  // 待处理控制消息计数
+        sem_t control_sem;                      // SEM模式: POSIX信号量
+        char control_sem_padding[64 - sizeof(sem_t)];
+        LockFreeRingBuffer<64> control_queue;   // 控制队列容量64（控制消息少）
         
-        // 方案2: POSIX Semaphore (推荐)
-        sem_t notify_sem;                 // SEM: POSIX信号量
-        char sem_padding[64 - sizeof(sem_t)];  // SEM: 缓存行对齐
-        
-        LockFreeRingBuffer<QUEUE_CAPACITY> queue;
+        // 🔧 数据队列（正常优先级）：普通数据消息
+        std::atomic<uint32_t> data_pending;
+        sem_t data_sem;
+        char data_sem_padding[64 - sizeof(sem_t)];
+        LockFreeRingBuffer<QUEUE_CAPACITY> data_queue;  // 数据队列容量256
         
         // 🔧 流控：背压机制
         std::atomic<uint32_t> congestion_level;  // 拥塞等级 0-100
         std::atomic<uint64_t> drop_count;        // 累计丢包数
         
-        char padding[136];  // Cache line alignment（调整padding补偿删除的FIFO字段）
+        char padding[64];  // Cache line alignment
     };
     
     // Node's shared memory layout
@@ -223,7 +225,12 @@ private:
         std::atomic<uint64_t> last_heartbeat;
         std::atomic<bool> ready;  // 🔧 两阶段提交：节点是否完全初始化
         std::atomic<int32_t> owner_pid;  // 🔧 进程PID：用于检测进程是否存活
-        char padding[31];  // 调整padding保持64字节对齐
+        
+        // 🔧 全局共享CV：所有InboundQueue共享同一个cond_var
+        pthread_mutex_t global_mutex;  // CV模式：全局互斥锁
+        pthread_cond_t global_cond;    // CV模式：全局条件变量
+        
+        char padding[64];  // Cache line alignment
     };
     
     struct NodeSharedMemory {

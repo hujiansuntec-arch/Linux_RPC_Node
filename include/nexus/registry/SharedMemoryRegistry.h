@@ -120,11 +120,16 @@ private:
     
     struct RegistryEntry {
         std::atomic<uint32_t> flags;  // Bit 0: valid, Bit 1: active
-        char node_id[NODE_ID_SIZE];
-        char shm_name[SHM_NAME_SIZE];
-        pid_t pid;
+        std::atomic<uint32_t> pid;    // Process ID as atomic
         std::atomic<uint64_t> last_heartbeat;
-        char padding[28];  // Padding for cache alignment (total 168 bytes)
+        
+        // 🔧 Store node_id and shm_name as atomic uint64_t arrays for true atomicity
+        // node_id: 64 bytes = 8 * uint64_t
+        std::atomic<uint64_t> node_id_atomic[8];
+        // shm_name: 64 bytes = 8 * uint64_t
+        std::atomic<uint64_t> shm_name_atomic[8];
+        
+        char padding[16];  // Padding for cache alignment
     };
     
     static_assert(sizeof(RegistryEntry) <= 192, "RegistryEntry size too large");
@@ -151,7 +156,13 @@ private:
     int findFreeEntryIndex() const;
     uint64_t getCurrentTimeMs() const;
     bool isProcessAlive(pid_t pid) const;
+
+public:
+    // 🔧 Atomic string helpers (made public for use in transport layer)
+    static void writeAtomicString(std::atomic<uint64_t>* atomic_array, const std::string& str, size_t max_bytes);
+    static std::string readAtomicString(const std::atomic<uint64_t>* atomic_array, size_t max_bytes);
     
+private:
     // State
     bool initialized_;
     void* shm_ptr_;
