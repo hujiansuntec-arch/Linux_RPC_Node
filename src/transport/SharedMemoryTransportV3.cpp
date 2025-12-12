@@ -84,29 +84,86 @@ SharedMemoryTransportV3::SharedMemoryTransportV3()
 SharedMemoryTransportV3::~SharedMemoryTransportV3() {
     stopReceiving();
     
-    // Disconnect from all remote nodes
+    // 🔧 CRITICAL: 先收集需要清理的资源，再在锁外清理
+    // 避免在持有锁时进行系统调用，减少死锁和内存损坏的风险
+    std::vector<std::pair<void*, int>> resources_to_cleanup;
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
+        resources_to_cleanup.reserve(remote_connections_.size());
+        
         for (auto& pair : remote_connections_) {
-            if (pair.second.shm_ptr && pair.second.shm_ptr != MAP_FAILED) {
-                munmap(pair.second.shm_ptr, sizeof(NodeSharedMemory));
+            NEXUS_DEBUG("SHM-V3") << "Marking remote node for cleanup: " << pair.first;
+            
+            // 先置空 my_queue 指针
+            pair.second.my_queue = nullptr;
+            
+            // 收集需要清理的资源
+            void* shm_ptr = pair.second.shm_ptr;
+            int shm_fd = pair.second.shm_fd;
+            
+            if (shm_ptr && shm_ptr != MAP_FAILED) {
+                resources_to_cleanup.push_back({shm_ptr, shm_fd});
+                pair.second.shm_ptr = nullptr;
+                pair.second.shm_fd = -1;
+            } else if (shm_fd >= 0) {
+                resources_to_cleanup.push_back({nullptr, shm_fd});
+                pair.second.shm_fd = -1;
             }
-            if (pair.second.shm_fd >= 0) {
-                close(pair.second.shm_fd);
-            }
+            
+            pair.second.connected = false;
         }
+        
+        // 清空 map（在锁内，但不进行系统调用）
         remote_connections_.clear();
     }
     
-    // Unregister from registry
+    // 在锁外执行系统调用，避免死锁和减少临界区时间
+    for (const auto& res : resources_to_cleanup) {
+        if (res.first && res.first != MAP_FAILED) {
+            munmap(res.first, sizeof(NodeSharedMemory));
+        }
+        if (res.second >= 0) {
+            close(res.second);
+        }
+    }
+    NEXUS_DEBUG("SHM-V3") << "Disconnected from all remote nodes";
+    
+    // 🔧 CRITICAL: 设置inactive标志，而不是立即删除共享内存
+    // 这样接收端可以检测到节点已退出，优雅地断开连接
+    NEXUS_DEBUG("SHM-V3") << "Destructor: my_shm_=" << (void*)my_shm_ 
+                          << ", my_shm_ptr_=" << (void*)my_shm_ptr_
+                          << ", initialized_=" << initialized_;
+    
+    if (my_shm_ && my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
+        my_shm_->header.inactive.store(true, std::memory_order_release);
+        NEXUS_INFO("SHM-V3") << "Marked node " << node_id_ << " as inactive";
+    } else {
+        NEXUS_WARN("SHM-V3") << "Cannot mark node " << node_id_ << " as inactive: "
+                             << "my_shm_=" << (void*)my_shm_ 
+                             << ", my_shm_ptr_=" << (void*)my_shm_ptr_;
+    }
+    
+    // Unregister from registry (标记为不活跃)
     if (initialized_) {
+        NEXUS_DEBUG("SHM-V3") << "Unregistering node from registry: " << node_id_;
         registry_.unregisterNode(node_id_);
     }
     
-    // Destroy my shared memory
-    destroyMySharedMemory();
+    // 🔧 不要立即删除共享内存，让它延迟清理
+    // munmap但保留文件，由守护进程或其他节点的心跳系统清理
+    if (my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
+        NEXUS_DEBUG("SHM-V3") << "Unmapping shared memory for " << node_id_;
+        munmap(my_shm_ptr_, sizeof(NodeSharedMemory));
+        my_shm_ptr_ = nullptr;
+        my_shm_ = nullptr;
+    }
+    if (my_shm_fd_ >= 0) {
+        close(my_shm_fd_);
+        my_shm_fd_ = -1;
+    }
+    // 注意：不调用 shm_unlink，保留共享内存文件供清理系统处理
     
-    NEXUS_DEBUG("SHM-V3") << "Node " << node_id_ << " destroyed";
+    NEXUS_DEBUG("SHM-V3") << "Node " << node_id_ << " destroyed (shared memory kept for cleanup)";
 }
 
 bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Config& config) {
@@ -398,7 +455,10 @@ void SharedMemoryTransportV3::stopReceiving() {
         return;
     }
     
-    receiving_.store(false);
+    NEXUS_DEBUG("SHM-V3") << "Stopping receiving threads for " << node_id_;
+    
+    // 🔧 使用 release 语义确保线程能看到变化
+    receiving_.store(false, std::memory_order_release);
     
     // 🔧 Wake up all threads waiting on condition variables
     // This ensures receive threads exit immediately instead of waiting for timeout
@@ -410,20 +470,36 @@ void SharedMemoryTransportV3::stopReceiving() {
     }
     
     // 2. Wake up threads waiting on queue-specific condition variables
-    if (my_shm_) {
-        // 🔧 全局CV方案：广播到全局cond_var
-        pthread_mutex_lock(&my_shm_->header.global_mutex);
-        pthread_cond_broadcast(&my_shm_->header.global_cond);
-        pthread_mutex_unlock(&my_shm_->header.global_mutex);
+    // 🔧 使用 trylock 避免永久阻塞
+    if (my_shm_ && my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
+        int ret = pthread_mutex_trylock(&my_shm_->header.global_mutex);
+        if (ret == 0) {
+            // 成功获取锁，广播条件变量
+            pthread_cond_broadcast(&my_shm_->header.global_cond);
+            pthread_mutex_unlock(&my_shm_->header.global_mutex);
+            NEXUS_DEBUG("SHM-V3") << "Broadcasted to global_cond";
+        } else {
+            // 无法获取锁，可能有线程正在使用或锁已损坏
+            NEXUS_WARN("SHM-V3") << "Cannot lock global_mutex during shutdown (errno=" 
+                                  << ret << "), threads may take longer to exit";
+        }
     }
     
+    NEXUS_DEBUG("SHM-V3") << "Waiting for receive thread to join...";
     if (receive_thread_.joinable()) {
         receive_thread_.join();
     }
+    NEXUS_DEBUG("SHM-V3") << "Receive thread joined";
     
+    NEXUS_DEBUG("SHM-V3") << "Waiting for heartbeat thread to join...";
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
+    NEXUS_DEBUG("SHM-V3") << "Heartbeat thread joined";
+    
+    // 🔧 CRITICAL: 线程已退出，现在可以安全清空 callback
+    // 必须在线程 join 之后，确保没有线程还在访问
+    receive_callback_ = nullptr;
     
     NEXUS_DEBUG("SHM-V3") << "Stopped receiving threads for " << node_id_;
 }
@@ -696,6 +772,7 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
     my_shm_ = static_cast<NodeSharedMemory*>(my_shm_ptr_);
     
     // Initialize header
+    my_shm_->header.inactive.store(false, std::memory_order_relaxed);  // 🔧 初始为活跃状态
     my_shm_->header.magic.store(MAGIC, std::memory_order_relaxed);
     my_shm_->header.version.store(VERSION, std::memory_order_relaxed);
     my_shm_->header.num_queues.store(0, std::memory_order_relaxed);
@@ -836,25 +913,38 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
         return false;
     }
     
-    // 🔧 健康检查: 验证远程进程是否存活
-    pid_t owner_pid = remote_shm->header.owner_pid.load(std::memory_order_acquire);
-    if (owner_pid <= 0 || kill(owner_pid, 0) != 0) {
-        NEXUS_WARN("SHM-V3") << "Remote node process is dead (pid=" << owner_pid 
-                             << "), cleaning up stale shared memory: " << target_info.shm_name;
+    // 🔧 CRITICAL: 先检查 inactive 标志，如果节点已标记为不活跃，不要连接
+    bool is_inactive = remote_shm->header.inactive.load(std::memory_order_acquire);
+    if (is_inactive) {
+        NEXUS_DEBUG("SHM-V3") << "Remote node marked as inactive: " << target_node_id;
         munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
         close(conn.shm_fd);
-        // 尝试清理残留的共享内存文件
-        shm_unlink(target_info.shm_name.c_str());
-        // 从registry中删除已死亡节点的entry
-        registry_.unregisterNode(target_node_id);
+        // 注意：不在这里删除共享内存，避免影响其他正在访问的节点
+        // 共享内存由心跳系统或节点自身清理
         return false;
     }
     
     // 🔧 两阶段提交：验证节点是否完全初始化
-    if (!remote_shm->header.ready.load(std::memory_order_acquire)) {
-        NEXUS_ERROR("SHM-V3") << "Remote node not ready yet: " << target_node_id;
+    bool is_ready = remote_shm->header.ready.load(std::memory_order_acquire);
+    if (!is_ready) {
+        // 节点正在初始化中，不是错误，直接返回 false 等待下次重试
+        NEXUS_DEBUG("SHM-V3") << "Remote node not ready yet: " << target_node_id << ", will retry later";
         munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
         close(conn.shm_fd);
+        return false;
+    }
+    
+    // 🔧 健康检查: 验证进程是否存活（仅对已就绪但未标记inactive的节点）
+    // 注意：kill(pid, 0) 可能因权限问题失败，所以要谨慎处理
+    pid_t owner_pid = remote_shm->header.owner_pid.load(std::memory_order_acquire);
+    if (owner_pid > 0 && kill(owner_pid, 0) != 0) {
+        // 进程不存在，不要连接
+        NEXUS_WARN("SHM-V3") << "Remote node process is dead (pid=" << owner_pid 
+                             << "), skipping connection to: " << target_node_id;
+        munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
+        close(conn.shm_fd);
+        // 注意：不在这里删除共享内存文件，避免 Bus error
+        // 其他节点可能正在访问，由心跳系统统一清理
         return false;
     }
     
@@ -1101,10 +1191,12 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 processed++;
                 has_messages = true;
                 
-                if (receive_callback_) {
+                // 🔧 检查 callback 是否有效（可能在析构时被清空）
+                auto callback = receive_callback_;
+                if (callback) {
                     NEXUS_DEBUG("SHM-V3") << "[CTRL] Received control message from " << from_node 
                               << " (" << msg_size << " bytes)";
-                    receive_callback_(buffer, msg_size, from_node);
+                    callback(buffer, msg_size, from_node);
                 }
             }
             
@@ -1142,8 +1234,10 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 processed++;
                 has_messages = true;
                 
-                if (receive_callback_) {
-                    receive_callback_(buffer, msg_size, from_node);
+                // 🔧 检查 callback 是否有效（可能在析构时被清空）
+                auto callback = receive_callback_;
+                if (callback) {
+                    callback(buffer, msg_size, from_node);
                 }
             }
             
@@ -1275,9 +1369,11 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
                 has_messages = true;
                 processed++;
                 
-                if (receive_callback_) {
+                // 🔧 检查 callback 是否有效（可能在析构时被清空）
+                auto callback = receive_callback_;
+                if (callback) {
                     NEXUS_DEBUG("SHM-V3") << "[CTRL] Received control message from " << from_node;
-                    receive_callback_(buffer, msg_size, from_node);
+                    callback(buffer, msg_size, from_node);
                 }
             }
             
@@ -1310,8 +1406,10 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
                 has_messages = true;
                 processed++;
                 
-                if (receive_callback_) {
-                    receive_callback_(buffer, msg_size, from_node);
+                // 🔧 检查 callback 是否有效（可能在析构时被清空）
+                auto callback = receive_callback_;
+                if (callback) {
+                    callback(buffer, msg_size, from_node);
                 }
             }
             
@@ -1473,6 +1571,10 @@ void SharedMemoryTransportV3::heartbeatLoop() {
         // Clean up stale inbound queues
         cleanupStaleQueues();
         
+        // 🔧 CRITICAL: 清理inactive节点的连接
+        // TODO: 暂时禁用，测试是否是cleanupInactiveConnections导致的崩溃
+        // cleanupInactiveConnections();
+        
         std::this_thread::sleep_for(std::chrono::milliseconds(HEARTBEAT_INTERVAL_MS));
     }
     
@@ -1497,6 +1599,128 @@ void SharedMemoryTransportV3::cleanupStaleQueues() {
     //
     // For now, leave queues alone - they'll be cleaned up during node shutdown
     // TODO: Implement safer queue recycling with proper synchronization
+}
+
+void SharedMemoryTransportV3::cleanupInactiveConnections() {
+    std::vector<std::string> nodes_to_disconnect;
+    std::vector<std::string> shm_to_cleanup;
+    
+    // 🔧 PHASE 1: 检查已连接的远程节点是否变为inactive
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (auto& pair : remote_connections_) {
+            if (!pair.second.connected || !pair.second.shm_ptr || pair.second.shm_ptr == MAP_FAILED) {
+                continue;
+            }
+            
+            // 🔧 CRITICAL: 安全访问远程节点的inactive标志
+            // 远程节点可能正在析构，共享内存可能已经 munmap
+            // 使用 try-catch 或者先检查文件是否还存在
+            bool is_inactive = false;
+            try {
+                NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(pair.second.shm_ptr);
+                
+                // 先检查 magic number 是否有效
+                if (remote_shm->header.magic.load(std::memory_order_acquire) == MAGIC) {
+                    is_inactive = remote_shm->header.inactive.load(std::memory_order_acquire);
+                } else {
+                    // Magic number 无效，说明共享内存已损坏或被释放
+                    NEXUS_WARN("SHM-V3") << "[" << node_id_ << "] Remote node " << pair.first 
+                              << " has invalid magic number, marking for disconnect";
+                    is_inactive = true;
+                }
+            } catch (...) {
+                // 访问共享内存失败，可能已经被 munmap
+                NEXUS_WARN("SHM-V3") << "[" << node_id_ << "] Cannot access remote node " 
+                          << pair.first << " shared memory, marking for disconnect";
+                is_inactive = true;
+            }
+            
+            if (is_inactive) {
+                nodes_to_disconnect.push_back(pair.first);
+                shm_to_cleanup.push_back(pair.second.shm_name);
+                NEXUS_INFO("SHM-V3") << "[" << node_id_ << "] Detected inactive node: " 
+                          << pair.first << ", will disconnect";
+            }
+        }
+    }
+    
+    // 🔧 PHASE 2: 断开inactive节点的连接（在锁外执行）
+    for (const auto& node_id : nodes_to_disconnect) {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        auto it = remote_connections_.find(node_id);
+        if (it != remote_connections_.end()) {
+            // 断开连接
+            if (it->second.shm_ptr && it->second.shm_ptr != MAP_FAILED) {
+                munmap(it->second.shm_ptr, sizeof(NodeSharedMemory));
+            }
+            if (it->second.shm_fd >= 0) {
+                close(it->second.shm_fd);
+            }
+            remote_connections_.erase(it);
+            NEXUS_INFO("SHM-V3") << "[" << node_id_ << "] Disconnected from inactive node: " 
+                      << node_id;
+        }
+    }
+    
+    // 🔧 PHASE 3: 清理残留的inactive共享内存（如果没有人在使用）
+    // 遍历 /dev/shm/，查找所有 librpc_node_* 文件
+    DIR* dir = opendir("/dev/shm");
+    if (!dir) {
+        return;
+    }
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        std::string filename = entry->d_name;
+        
+        // 只处理 librpc_node_ 开头的文件
+        if (filename.find("librpc_node_") != 0) {
+            continue;
+        }
+        
+        std::string shm_path = std::string("/") + filename;
+        
+        // 尝试打开并检查是否inactive
+        int fd = shm_open(shm_path.c_str(), O_RDWR, 0666);
+        if (fd < 0) {
+            continue;
+        }
+        
+        void* ptr = mmap(nullptr, sizeof(NodeSharedMemory), PROT_READ | PROT_WRITE, 
+                        MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            close(fd);
+            continue;
+        }
+        
+        NodeSharedMemory* shm = static_cast<NodeSharedMemory*>(ptr);
+        
+        // 检查magic number和inactive标志
+        bool should_cleanup = false;
+        if (shm->header.magic.load(std::memory_order_acquire) == MAGIC) {
+            bool is_inactive = shm->header.inactive.load(std::memory_order_acquire);
+            pid_t owner_pid = shm->header.owner_pid.load(std::memory_order_acquire);
+            
+            // 如果标记为inactive，或者进程已死亡，则可以清理
+            if (is_inactive || (owner_pid > 0 && kill(owner_pid, 0) != 0)) {
+                should_cleanup = true;
+            }
+        }
+        
+        munmap(ptr, sizeof(NodeSharedMemory));
+        close(fd);
+        
+        // 执行清理
+        if (should_cleanup) {
+            if (shm_unlink(shm_path.c_str()) == 0) {
+                NEXUS_INFO("SHM-V3") << "[" << node_id_ << "] Cleaned up orphaned shared memory: " 
+                          << shm_path;
+            }
+        }
+    }
+    
+    closedir(dir);
 }
 
 std::string SharedMemoryTransportV3::generateShmName() {

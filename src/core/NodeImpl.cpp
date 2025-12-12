@@ -54,6 +54,11 @@ NodeImpl::NodeImpl(const std::string& node_id, bool use_udp, [[maybe_unused]] ui
 NodeImpl::~NodeImpl() {
     running_ = false;
     
+    // 🔧 CRITICAL: 先 unregister，广播 NODE_LEAVE
+    // 这样其他节点可以在本节点完全退出前收到通知
+    // 必须在停止线程之前，因为 broadcastNodeEvent 需要 shm_transport_v3_
+    unregisterNode();
+    
     // Stop UDP heartbeat thread
     stopUdpHeartbeat();
     
@@ -87,8 +92,7 @@ NodeImpl::~NodeImpl() {
         udp_transport_->shutdown();
     }
     
-    // Unregister this node
-    unregisterNode();
+    // shm_transport_v3_ 会在成员变量析构时自动清理
 }
 
 // Initialization method to be called after construction

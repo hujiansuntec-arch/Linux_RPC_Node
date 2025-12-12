@@ -225,6 +225,7 @@ private:
         std::atomic<uint64_t> last_heartbeat;
         std::atomic<bool> ready;  // 🔧 两阶段提交：节点是否完全初始化
         std::atomic<int32_t> owner_pid;  // 🔧 进程PID：用于检测进程是否存活
+        std::atomic<bool> inactive;  // 🔧 CRITICAL: 节点已退出标志（true=已退出，接收端应停止访问）
         
         // 🔧 全局共享CV：所有InboundQueue共享同一个cond_var
         pthread_mutex_t global_mutex;  // CV模式：全局互斥锁
@@ -268,6 +269,7 @@ private:
     void receiveLoop_CV();    // Condition Variable模式的接收循环
     void heartbeatLoop();
     void cleanupStaleQueues();
+    void cleanupInactiveConnections();  // 🔧 清理inactive节点的连接
     std::string generateShmName();
     
     // State
