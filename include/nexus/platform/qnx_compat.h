@@ -16,4 +16,4 @@
 // Linux/POSIX configuration
 #define LIBRPC_SHM_DIR "/dev/shm"
 
-#endif // __QNXNTO__
+#endif  // __QNXNTO__
