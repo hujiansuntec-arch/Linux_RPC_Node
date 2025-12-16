@@ -677,6 +677,36 @@ int SharedMemoryRegistry::getActiveNodeCount() const {
     return registry_->header.num_entries.load(std::memory_order_acquire);
 }
 
+bool SharedMemoryRegistry::amICleanupMaster() const {
+    if (!initialized_) {
+        return false;
+    }
+    
+    RegistryLock lock(&registry_->header.global_lock, 1000);
+    if (!lock.isLocked()) {
+        return false;  // Can't acquire lock, not safe to cleanup
+    }
+    
+    pid_t my_pid = getpid();
+    pid_t smallest_active_pid = INT32_MAX;
+    
+    // Find smallest PID among all active processes
+    for (int i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
+        pid_t pid = registry_->header.ref_pids[i].load(std::memory_order_acquire);
+        if (pid > 0) {
+            // Verify process is still alive
+            if (kill(pid, 0) == 0 || errno == EPERM) {
+                if (pid < smallest_active_pid) {
+                    smallest_active_pid = pid;
+                }
+            }
+        }
+    }
+    
+    // I'm the cleanup master if I have the smallest PID
+    return (my_pid == smallest_active_pid);
+}
+
 bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
     // Try to open registry
     int fd = shm_open(REGISTRY_SHM_NAME, O_RDWR, 0666);

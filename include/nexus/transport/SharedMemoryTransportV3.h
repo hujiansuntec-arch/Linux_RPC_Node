@@ -223,11 +223,16 @@ private:
         std::atomic<uint32_t> num_queues;
         std::atomic<uint32_t> max_queues;
         std::atomic<uint64_t> last_heartbeat;
-        std::atomic<bool> ready;  // 🔧 两阶段提交：节点是否完全初始化
-        std::atomic<int32_t> owner_pid;  // 🔧 进程PID：用于检测进程是否存活
-        std::atomic<bool> inactive;  // 🔧 CRITICAL: 节点已退出标志（true=已退出，接收端应停止访问）
+        std::atomic<bool> ready;  // 两阶段提交：节点是否完全初始化
+        std::atomic<int32_t> owner_pid;  // 进程PID：用于检测进程是否存活
         
-        // 🔧 全局共享CV：所有InboundQueue共享同一个cond_var
+        // CRITICAL: 访问者PID数组 - 跟踪所有打开此共享内存的进程
+        // 用于安全清理判断：只有当所有访问者都死亡时才能删除
+        static constexpr int MAX_ACCESSORS = 64;
+        std::atomic<int32_t> accessor_pids[MAX_ACCESSORS];
+        std::atomic<uint32_t> num_accessors;  // 当前访问者数量
+        
+        // 全局共享CV：所有InboundQueue共享同一个cond_var
         pthread_mutex_t global_mutex;  // CV模式：全局互斥锁
         pthread_cond_t global_cond;    // CV模式：全局条件变量
         
@@ -269,8 +274,14 @@ private:
     void receiveLoop_CV();    // Condition Variable模式的接收循环
     void heartbeatLoop();
     void cleanupStaleQueues();
-    void cleanupInactiveConnections();  // 🔧 清理inactive节点的连接
     std::string generateShmName();
+    
+    // Accessor PID tracking helpers
+    void addAccessor(pid_t pid);
+    void removeAccessor(pid_t pid);
+    static void addAccessorToNode(NodeHeader* header, pid_t pid);
+    static void removeAccessorFromNode(NodeHeader* header, pid_t pid);
+    static bool hasActiveAccessors(NodeHeader* header);
     
     // State
     std::string node_id_;

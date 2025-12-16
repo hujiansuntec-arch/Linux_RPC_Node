@@ -1160,13 +1160,43 @@ void NodeImpl::setQueueOverflowCallback(QueueOverflowCallback callback) {
 size_t NodeImpl::cleanupOrphanedChannels() {
     size_t total_cleaned = 0;
     
+    // CRITICAL: Only ONE process should cleanup to avoid race conditions
+    // Strategy: Elect the node with smallest PID as the "cleanup master"
+    // This prevents multiple processes from calling shm_unlink() simultaneously
+    
+    pid_t my_pid = getpid();
+    bool i_am_cleanup_master = false;
+    
+    // Check if I'm the cleanup master by querying registry
+    if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
+        int active_count = SharedMemoryTransportV3::getActiveNodeCount();
+        if (active_count > 0) {
+            // Query registry for all active nodes
+            SharedMemoryRegistry temp_registry;
+            if (temp_registry.initialize()) {
+                // The actual election happens in SharedMemoryRegistry internally.
+                i_am_cleanup_master = temp_registry.amICleanupMaster();
+            }
+        } else {
+            // No other nodes, I'm the only one
+            i_am_cleanup_master = true;
+        }
+    }
+    
+    if (!i_am_cleanup_master) {
+        // Not my turn to cleanup, skip
+        NEXUS_DEBUG("IMPL") << "Cleanup skipped: not the cleanup master (PID " << my_pid << ")";
+        return 0;
+    }
+    
+    NEXUS_DEBUG("IMPL") << "I am the cleanup master (PID " << my_pid << "), performing cleanup...";
+    
     // 1. Cleanup LargeDataChannel orphaned shared memory
     size_t channel_cleaned = LargeDataChannel::cleanupOrphanedChannels(CLEANUP_ORPHAN_TIMEOUT_SECONDS);
     total_cleaned += channel_cleaned;
     
     // 2. Cleanup SharedMemoryTransportV3 orphaned node shared memory
     if (SharedMemoryTransportV3::cleanupOrphanedMemory()) {
-        // cleanupOrphanedMemory returns bool, but logs details internally
         NEXUS_DEBUG("IMPL") << "Cleaned up orphaned transport memory";
     }
     

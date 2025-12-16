@@ -108,6 +108,14 @@ public:
     int getActiveNodeCount() const;
     
     /**
+     * @brief Check if current process is the cleanup master
+     * Election strategy: smallest PID among active processes
+     * This ensures only ONE process performs cleanup, avoiding race conditions
+     * @return true if this process should perform cleanup
+     */
+    bool amICleanupMaster() const;
+    
+    /**
      * @brief Check if initialized
      */
     bool isInitialized() const { return initialized_; }

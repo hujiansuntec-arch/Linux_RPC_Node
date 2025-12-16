@@ -8,7 +8,6 @@ cd /home/fz296w/workspace/Nexus/Nexus
 # 清理环境
 echo "清理环境..."
 killall -9 test_duplex_v2 2>/dev/null || true
-rm -f /dev/shm/librpc_*
 rm -f ./tmp/node*.log
 
 # 设置参数
