@@ -136,83 +136,8 @@ void NodeImpl::initialize(uint16_t udp_port) {
 
             // Set receive callback - parse MessagePacket format
             shm_transport_v3_->setReceiveCallback(
-                [this](const uint8_t* data, size_t size, [[maybe_unused]] const std::string& from) {
-                    // Data should be in MessagePacket format
-                    if (size < sizeof(MessagePacket)) {
-                        return;
-                    }
-
-                    const MessagePacket* packet = reinterpret_cast<const MessagePacket*>(data);
-                    if (!packet->isValid()) {
-                        NEXUS_ERROR("IMPL") << "Received invalid packet";
-                        return;
-                    }
-
-                    std::string source_node(packet->node_id);
-                    NEXUS_INFO("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
-
-                    // Skip our own messages (critical: avoid self-reception)
-                    if (source_node == node_id_) {
-                        return;
-                    }
-
-                    // Use weak_ptr to check if this node is still alive
-                    // This prevents accessing destroyed members if callback runs during destruction
-                    // Note: In this lambda 'this' is captured, but we can't easily get a weak_ptr to 'this'
-                    // without enable_shared_from_this.
-                    // However, shm_transport_v3_ is owned by NodeImpl, so if we are here, NodeImpl should be alive.
-                    // The issue might be in how callbacks are dispatched or if transport outlives NodeImpl.
-                    // But transport is a unique_ptr member, so it dies with NodeImpl.
-                    // The crash "bad_weak_ptr" suggests something is trying to create shared_ptr from this
-                    // when it's already destroying or not managed by shared_ptr.
-                    // GlobalRegistry::registerNode takes a weak_ptr.
-                    // If we call registerNode() in constructor/initialize, we need to be careful.
-                    std::string group = packet->group_len > 0 ? std::string(packet->getGroup(), packet->group_len) : "";
-                    std::string topic = packet->topic_len > 0 ? std::string(packet->getTopic(), packet->topic_len) : "";
-
-                    MessageType msg_type = static_cast<MessageType>(packet->msg_type);
-
-                    switch (msg_type) {
-                        case MessageType::DATA:
-                            handleMessage(source_node, group, topic, packet->getPayload(), packet->payload_len);
-                            break;
-
-                        case MessageType::SERVICE_REGISTER:
-                            // Enqueue to system message thread (avoid blocking receive thread)
-                            enqueueSystemMessage(SystemMessageType::SERVICE_REGISTER, source_node, group, topic,
-                                                 packet->getPayload(), packet->payload_len);
-                            break;
-
-                        case MessageType::SERVICE_UNREGISTER:
-                            // Enqueue to system message thread
-                            enqueueSystemMessage(SystemMessageType::SERVICE_UNREGISTER, source_node, group, topic,
-                                                 packet->getPayload(), packet->payload_len);
-                            break;
-
-                        case MessageType::NODE_JOIN:
-                            // Enqueue to system message thread
-                            NEXUS_DEBUG("IMPL") << "Received NODE_JOIN message from " << source_node;
-                            enqueueSystemMessage(SystemMessageType::NODE_JOIN, source_node, group, topic, nullptr, 0);
-                            break;
-
-                        case MessageType::NODE_LEAVE:
-                            // Enqueue to system message thread
-                            enqueueSystemMessage(SystemMessageType::NODE_LEAVE, source_node, group, topic, nullptr, 0);
-                            break;
-
-                        case MessageType::SUBSCRIBE:
-                        case MessageType::UNSUBSCRIBE:
-                        case MessageType::QUERY_SUBSCRIPTIONS:
-                        case MessageType::SUBSCRIPTION_REPLY:
-                            // These message types are not used in current implementation
-                            // Reserved for future subscription management features
-                            NEXUS_DEBUG("IMPL") << "Ignoring unused message type: " << static_cast<int>(msg_type);
-                            break;
-
-                        case MessageType::HEARTBEAT:
-                            // Shared memory doesn't need heartbeat (managed by OS)
-                            break;
-                    }
+                [this](const uint8_t* data, size_t size, const std::string& from) {
+                    processPacket(data, size, from);
                 });
             shm_transport_v3_->startReceiving();
 
@@ -659,7 +584,7 @@ void NodeImpl::deliverInProcess(const std::string& group, const std::string& top
     // Get all registered nodes
     auto nodes = getAllNodes();
 
-    // Deliver to each node (except ourselves)
+    // Deliver to each node (excluding ourselves to prevent loops)
     for (const auto& node : nodes) {
         if (node && node.get() != this) {
             node->handleMessage(node_id_, group, topic, payload, payload_len);
@@ -1628,34 +1553,52 @@ void NodeImpl::handleQuerySubscriptions([[maybe_unused]] const std::string& from
     auto& registry = Nexus::rpc::GlobalRegistry::instance();
     auto all_services = registry.findServices();
 
+    NEXUS_DEBUG("IMPL") << "Handling QUERY_SUBSCRIPTIONS from " << from_node << ":" << from_port 
+                        << ". Found " << all_services.size() << " total services.";
+
     // Reply with each of our services via SERVICE_REGISTER (point-to-point send)
     for (const auto& svc : all_services) {
-        if (svc.node_id == node_id_ && svc.transport == TransportType::UDP) {
-            // Serialize service descriptor to payload
-            std::vector<uint8_t> payload;
-            payload.push_back(static_cast<uint8_t>(svc.type));
-            payload.push_back(static_cast<uint8_t>(svc.transport));
+        if (svc.node_id == node_id_) {
+            ServiceDescriptor response_svc = svc;
+            bool send_response = false;
 
-            uint8_t channel_len = static_cast<uint8_t>(svc.channel_name.size());
-            payload.push_back(channel_len);
-
-            uint16_t udp_addr_len = static_cast<uint16_t>(svc.udp_address.size());
-            payload.push_back(static_cast<uint8_t>(udp_addr_len & 0xFF));
-            payload.push_back(static_cast<uint8_t>((udp_addr_len >> 8) & 0xFF));
-
-            if (channel_len > 0) {
-                payload.insert(payload.end(), svc.channel_name.begin(), svc.channel_name.end());
-            }
-            if (udp_addr_len > 0) {
-                payload.insert(payload.end(), svc.udp_address.begin(), svc.udp_address.end());
+            if (svc.transport == TransportType::UDP) {
+                send_response = true;
+            } else if (svc.transport == TransportType::SHARED_MEMORY && use_udp_ && udp_transport_ && udp_transport_->isInitialized()) {
+                // Convert to UDP descriptor for the remote node
+                response_svc.transport = TransportType::UDP;
+                response_svc.udp_address = "0.0.0.0:" + std::to_string(getUdpPort());
+                send_response = true;
             }
 
-            // Build SERVICE_REGISTER packet
-            auto packet = MessageBuilder::build(node_id_, svc.group, svc.topic, payload.data(), payload.size(),
-                                                getUdpPort(), MessageType::SERVICE_REGISTER);
+            if (send_response) {
+                NEXUS_DEBUG("IMPL") << "Sending service info for " << response_svc.group << "/" << response_svc.topic;
+                // Serialize service descriptor to payload
+                std::vector<uint8_t> payload;
+                payload.push_back(static_cast<uint8_t>(response_svc.type));
+                payload.push_back(static_cast<uint8_t>(response_svc.transport));
 
-            // Send directly to the querying node (point-to-point)
-            udp_transport_->send(packet.data(), packet.size(), target_ip, from_port);
+                uint8_t channel_len = static_cast<uint8_t>(response_svc.channel_name.size());
+                payload.push_back(channel_len);
+
+                uint16_t udp_addr_len = static_cast<uint16_t>(response_svc.udp_address.size());
+                payload.push_back(static_cast<uint8_t>(udp_addr_len & 0xFF));
+                payload.push_back(static_cast<uint8_t>((udp_addr_len >> 8) & 0xFF));
+
+                if (channel_len > 0) {
+                    payload.insert(payload.end(), response_svc.channel_name.begin(), response_svc.channel_name.end());
+                }
+                if (udp_addr_len > 0) {
+                    payload.insert(payload.end(), response_svc.udp_address.begin(), response_svc.udp_address.end());
+                }
+
+                // Build SERVICE_REGISTER packet
+                auto packet = MessageBuilder::build(node_id_, response_svc.group, response_svc.topic, payload.data(), payload.size(),
+                                                    getUdpPort(), MessageType::SERVICE_REGISTER);
+
+                // Send directly to the querying node (point-to-point)
+                udp_transport_->send(packet.data(), packet.size(), target_ip, from_port);
+            }
         }
     }
 }
@@ -1729,6 +1672,67 @@ void NodeImpl::checkUdpTimeouts() {
 }
 
 // ==================== End UDP Heartbeat ====================
+
+void NodeImpl::processPacket(const uint8_t* data, size_t size, [[maybe_unused]] const std::string& from) {
+    // Data should be in MessagePacket format
+    if (size < sizeof(MessagePacket)) {
+        return;
+    }
+
+    const MessagePacket* packet = reinterpret_cast<const MessagePacket*>(data);
+    if (!packet->isValid()) {
+        NEXUS_ERROR("IMPL") << "Received invalid packet";
+        return;
+    }
+
+    std::string source_node(packet->node_id);
+    NEXUS_INFO("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
+
+    // Skip our own messages (critical: avoid self-reception)
+    if (source_node == node_id_) {
+        return;
+    }
+
+    std::string group = packet->group_len > 0 ? std::string(packet->getGroup(), packet->group_len) : "";
+    std::string topic = packet->topic_len > 0 ? std::string(packet->getTopic(), packet->topic_len) : "";
+
+    MessageType msg_type = static_cast<MessageType>(packet->msg_type);
+
+    switch (msg_type) {
+        case MessageType::DATA:
+            handleMessage(source_node, group, topic, packet->getPayload(), packet->payload_len);
+            break;
+
+        case MessageType::SERVICE_REGISTER:
+            enqueueSystemMessage(SystemMessageType::SERVICE_REGISTER, source_node, group, topic,
+                                 packet->getPayload(), packet->payload_len);
+            break;
+
+        case MessageType::SERVICE_UNREGISTER:
+            enqueueSystemMessage(SystemMessageType::SERVICE_UNREGISTER, source_node, group, topic,
+                                 packet->getPayload(), packet->payload_len);
+            break;
+
+        case MessageType::NODE_JOIN:
+            NEXUS_DEBUG("IMPL") << "Received NODE_JOIN message from " << source_node;
+            enqueueSystemMessage(SystemMessageType::NODE_JOIN, source_node, group, topic, nullptr, 0);
+            break;
+
+        case MessageType::NODE_LEAVE:
+            enqueueSystemMessage(SystemMessageType::NODE_LEAVE, source_node, group, topic, nullptr, 0);
+            break;
+
+        case MessageType::SUBSCRIBE:
+        case MessageType::UNSUBSCRIBE:
+        case MessageType::QUERY_SUBSCRIPTIONS:
+        case MessageType::SUBSCRIPTION_REPLY:
+            NEXUS_DEBUG("IMPL") << "Ignoring unused message type: " << static_cast<int>(msg_type);
+            break;
+
+        case MessageType::HEARTBEAT:
+            break;
+    }
+}
 
 // Factory functions
 std::shared_ptr<Node> createNode(const std::string& node_id, TransportMode mode) {

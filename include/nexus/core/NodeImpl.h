@@ -195,6 +195,9 @@ private:
     void handleNodeEvent(const std::string& from_node, bool is_joined);
     void notifyNodeEvent(ServiceEvent event, const std::string& node_id);
 
+    // Process incoming packet (extracted for testing)
+    void processPacket(const uint8_t* data, size_t size, const std::string& from);
+
     // Async message processing
     static constexpr size_t MAX_QUEUE_SIZE = 25000;  // Max messages per queue (increased for high throughput)
     mutable std::mutex message_queue_mutexes_[NUM_PROCESSING_THREADS];

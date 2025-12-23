@@ -184,6 +184,24 @@ if(BUILD_TESTS)
         tests/unit/test_large_data_policies.cpp
         tests/unit/test_registry_advanced_coverage.cpp
         tests/unit/test_registry_coverage_extra.cpp
+        tests/unit/test_node_impl_extra.cpp
+        tests/unit/test_logger_coverage.cpp
+        tests/unit/test_large_data_coverage.cpp
+        tests/unit/test_large_data_advanced.cpp
+        tests/unit/test_node_impl_advanced.cpp
+        tests/unit/test_transport_v3_advanced.cpp
+        tests/unit/test_node_impl_more_coverage.cpp
+        tests/unit/test_node_impl_coverage_gap.cpp
+        tests/unit/test_node_impl_service_discovery.cpp
+        tests/unit/test_node_udp_extended.cpp
+        tests/unit/test_node_impl_coverage_boost.cpp
+        tests/unit/test_node_impl_coverage_final.cpp
+        tests/unit/test_transport_v3_coverage_final.cpp
+        tests/unit/test_transport_v3_modes.cpp
+        tests/unit/test_large_data_coverage_final.cpp
+        tests/unit/test_large_data_extra_coverage.cpp
+        tests/unit/test_udp_transport_coverage_final.cpp
+        tests/unit/test_coverage_gap_final.cpp
     )
 
     add_executable(unit_tests ${UNIT_TEST_SOURCES})

@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 def generate_report():
-    build_dir = "build_test"
+    build_dir = "build"
     source_root = os.getcwd()
     
     # Find all gcda files
