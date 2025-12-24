@@ -336,7 +336,7 @@ Node::Error NodeImpl::subscribe(const Property& msg_group, const std::vector<Pro
         return Error::NOT_INITIALIZED;
     }
 
-    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+    std::unique_lock<std::shared_timed_mutex> lock(subscriptions_mutex_);
 
     // Get or create subscription info for this group
     auto& sub_info = subscriptions_[msg_group];
@@ -402,7 +402,7 @@ Node::Error NodeImpl::unsubscribe(const Property& msg_group, const std::vector<P
     std::vector<std::string> topics_to_broadcast;
 
     {
-        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        std::unique_lock<std::shared_timed_mutex> lock(subscriptions_mutex_);
 
         auto it = subscriptions_.find(msg_group);
         if (it == subscriptions_.end()) {
@@ -556,7 +556,7 @@ std::shared_ptr<LargeDataChannel> NodeImpl::getLargeDataChannel(const std::strin
 }
 
 bool NodeImpl::isSubscribed(const Property& msg_group, const Property& topic) const {
-    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+    std::shared_lock<std::shared_timed_mutex> lock(subscriptions_mutex_);
 
     auto it = subscriptions_.find(msg_group);
     if (it == subscriptions_.end()) {
@@ -785,7 +785,7 @@ void NodeImpl::enqueueMessage(const std::string& source_node_id, const std::stri
                               const uint8_t* payload, size_t payload_len) {
     // Quick check if we're subscribed (avoid copying unnecessary data)
     {
-        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        std::shared_lock<std::shared_timed_mutex> lock(subscriptions_mutex_);
         auto it = subscriptions_.find(group);
         if (it == subscriptions_.end() || it->second.topics.find(topic) == it->second.topics.end()) {
             return;  // Not subscribed
@@ -898,7 +898,7 @@ void NodeImpl::messageProcessingThread(size_t thread_id) {
             // Get callback (subscription already verified in enqueueMessage)
             Callback callback;
             {
-                std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+                std::shared_lock<std::shared_timed_mutex> lock(subscriptions_mutex_);
                 const auto it = subscriptions_.find(msg.group);
                 if (it != subscriptions_.end()) {
                     callback = it->second.callback;

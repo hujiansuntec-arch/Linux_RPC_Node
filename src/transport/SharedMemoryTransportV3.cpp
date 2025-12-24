@@ -4,7 +4,9 @@
 #include <fcntl.h>
 #include <pthread.h>    // 🔧 POSIX线程支持（Condition Variable）
 #include <signal.h>     // For kill() process detection
+#ifndef __QNXNTO__
 #include <sys/epoll.h>  // 🔧 epoll支持（FIFO模式）
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -303,22 +305,18 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
             InboundQueue* queue = it->second.my_queue;
 
             // 🔧 单CV方案：统一的mutex/cond_var，根据消息类型选择队列
-            LockFreeRingBuffer<256>* target_queue;
-            sem_t* target_sem;
-            std::atomic<uint32_t>* target_pending;
+            sem_t* target_sem = nullptr;
+            std::atomic<uint32_t>* target_pending = nullptr;
+            bool success = false;
 
             if (is_control) {
-                target_queue = reinterpret_cast<LockFreeRingBuffer<256>*>(&queue->control_queue);
-                target_sem = &queue->control_sem;
-                target_pending = &queue->control_pending;
+                success = queue->control_queue.tryWrite(data, size);
+                if (success) {
+                    target_sem = &queue->control_sem;
+                    target_pending = &queue->control_pending;
+                }
             } else {
-                target_queue = &queue->data_queue;
-                target_sem = &queue->data_sem;
-                target_pending = &queue->data_pending;
-            }
-
-            // 🔧 流控：检查拥塞等级（仅数据队列）
-            if (!is_control) {
+                // 🔧 流控：检查拥塞等级（仅数据队列）
                 uint32_t congestion = queue->congestion_level.load(std::memory_order_relaxed);
                 if (congestion > 0 && congestion <= SHM_CONGESTION_MAX) {
                     int backoff_us = static_cast<int>(congestion) * SHM_BACKOFF_BASE_US;
@@ -326,10 +324,15 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
                         std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
                     }
                 }
+                
+                success = queue->data_queue.tryWrite(data, size);
+                if (success) {
+                    target_sem = &queue->data_sem;
+                    target_pending = &queue->data_pending;
+                }
             }
 
             // 尝试发送
-            bool success = target_queue->tryWrite(node_id_.c_str(), data, size);
             if (success) {
                 stats_messages_sent_++;
                 stats_bytes_sent_ += size;
@@ -393,21 +396,24 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
             InboundQueue* queue = it->second.my_queue;
 
             // 🔧 单CV方案：统一的cond_var，根据消息类型选择队列
-            LockFreeRingBuffer<256>* target_queue;
-            sem_t* target_sem;
-            std::atomic<uint32_t>* target_pending;
+            sem_t* target_sem = nullptr;
+            std::atomic<uint32_t>* target_pending = nullptr;
+            bool success = false;
 
             if (is_control) {
-                target_queue = reinterpret_cast<LockFreeRingBuffer<256>*>(&queue->control_queue);
-                target_sem = &queue->control_sem;
-                target_pending = &queue->control_pending;
+                success = queue->control_queue.tryWrite(data, size);
+                if (success) {
+                    target_sem = &queue->control_sem;
+                    target_pending = &queue->control_pending;
+                }
             } else {
-                target_queue = &queue->data_queue;
-                target_sem = &queue->data_sem;
-                target_pending = &queue->data_pending;
+                success = queue->data_queue.tryWrite(data, size);
+                if (success) {
+                    target_sem = &queue->data_sem;
+                    target_pending = &queue->data_pending;
+                }
             }
 
-            bool success = target_queue->tryWrite(node_id_.c_str(), data, size);
             if (success) {
                 stats_messages_sent_++;
                 stats_bytes_sent_ += size;
@@ -1263,12 +1269,14 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
 
             // 处理控制队列的所有消息（控制消息少，全部处理）
             int processed = 0;
+            // 🔧 Read sender ID once from queue metadata
+            std::string from_node = SharedMemoryRegistry::readAtomicString(q->sender_id_atomic, 64);
+
             while (true) {
-                char from_node[64];
                 size_t msg_size = MESSAGE_SIZE;
 
                 // 🔧 直接使用control_queue（LockFreeRingBuffer<64>）
-                if (!q->control_queue.tryRead(from_node, buffer, msg_size)) {
+                if (!q->control_queue.tryRead(buffer, msg_size)) {
                     break;
                 }
 
@@ -1308,12 +1316,13 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
             // 限流：每轮每队列最多处理N条数据消息，避免阻塞下一轮控制消息处理
             int processed = 0;
             const int MAX_DATA_PER_QUEUE = 16;
+            // 🔧 Read sender ID once from queue metadata
+            std::string from_node = SharedMemoryRegistry::readAtomicString(q->sender_id_atomic, 64);
 
             while (processed < MAX_DATA_PER_QUEUE) {
-                char from_node[64];
                 size_t msg_size = MESSAGE_SIZE;
 
-                if (!q->data_queue.tryRead(from_node, buffer, msg_size)) {
+                if (!q->data_queue.tryRead(buffer, msg_size)) {
                     break;
                 }
 
@@ -1439,12 +1448,14 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
             }
 
             int processed = 0;
+            // 🔧 Read sender ID once from queue metadata
+            std::string from_node = SharedMemoryRegistry::readAtomicString(q->sender_id_atomic, 64);
+
             while (true) {
-                char from_node[64];
                 size_t msg_size = MESSAGE_SIZE;
 
                 // 🔧 直接使用control_queue（LockFreeRingBuffer<64>）
-                if (!q->control_queue.tryRead(from_node, buffer, msg_size)) {
+                if (!q->control_queue.tryRead(buffer, msg_size)) {
                     break;
                 }
 
@@ -1476,12 +1487,13 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
 
             int processed = 0;
             const int MAX_DATA_PER_QUEUE = 16;
+            // 🔧 Read sender ID once from queue metadata
+            std::string from_node = SharedMemoryRegistry::readAtomicString(q->sender_id_atomic, 64);
 
             while (processed < MAX_DATA_PER_QUEUE) {
-                char from_node[64];
                 size_t msg_size = MESSAGE_SIZE;
 
-                if (!q->data_queue.tryRead(from_node, buffer, msg_size)) {
+                if (!q->data_queue.tryRead(buffer, msg_size)) {
                     break;
                 }
 

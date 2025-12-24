@@ -70,8 +70,9 @@ struct TopicStats {
     std::atomic<uint64_t> recv_count{0};
     std::atomic<uint64_t> lost_count{0};
     std::atomic<uint64_t> out_of_order{0};
+    std::atomic<uint64_t> data_mismatch{0};
     std::atomic<uint64_t> total_latency_us{0};
-    uint32_t last_sequence{0};
+    std::map<uint32_t, uint32_t> sender_last_sequence;
     std::mutex mutex;
 };
 
@@ -192,10 +193,33 @@ void onMessage(const std::string& group,
         
         // 检查顺序
         std::lock_guard<std::mutex> lock(stats.mutex);
-        if (msg->sequence < stats.last_sequence) {
-            stats.out_of_order.fetch_add(1, std::memory_order_relaxed);
+        auto it = stats.sender_last_sequence.find(msg->sender_id);
+        if (it != stats.sender_last_sequence.end()) {
+            if (msg->sequence < it->second) {
+                stats.out_of_order.fetch_add(1, std::memory_order_relaxed);
+            }
+            it->second = msg->sequence;
+        } else {
+            stats.sender_last_sequence[msg->sender_id] = msg->sequence;
         }
-        stats.last_sequence = msg->sequence;
+
+        // 验证可变长度数据完整性
+        size_t header_size = sizeof(TestMessage);
+        if (len > header_size) {
+            const char* extra = reinterpret_cast<const char*>(data) + header_size;
+            size_t extra_len = len - header_size;
+            char expected = (char)('A' + (msg->sequence % 26));
+            bool mismatch = false;
+            for (size_t i = 0; i < extra_len; ++i) {
+                if (extra[i] != expected) {
+                    mismatch = true;
+                    break;
+                }
+            }
+            if (mismatch) {
+                stats.data_mismatch.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -233,7 +257,11 @@ void publishThread(std::shared_ptr<Node> node,
             snprintf(msg.payload, sizeof(msg.payload), 
                     "P%d-SEQ%u", g_config.process_id, msg.sequence);
             
-            msg_str = std::string(reinterpret_cast<const char*>(&msg), sizeof(msg));
+            // 生成可变长度数据 (0-1024字节)
+            size_t extra_len = msg.sequence % 1025;
+            std::string extra_data(extra_len, (char)('A' + (msg.sequence % 26)));
+            
+            msg_str = std::string(reinterpret_cast<const char*>(&msg), sizeof(msg)) + extra_data;
             
             if (stats_ptr) {
                 stats_ptr->sent_count.fetch_add(1, std::memory_order_relaxed);
@@ -273,6 +301,7 @@ void generateFinalReport() {
     
     uint64_t total_lost = 0;
     uint64_t total_ooo = 0;
+    uint64_t total_mismatch = 0;
     uint64_t total_latency = 0;
     uint64_t total_recv = 0;
     
@@ -287,6 +316,7 @@ void generateFinalReport() {
         uint64_t recv = stats.recv_count.load(std::memory_order_relaxed);
         uint64_t lost = stats.lost_count.load(std::memory_order_relaxed);
         uint64_t ooo = stats.out_of_order.load(std::memory_order_relaxed);
+        uint64_t mismatch = stats.data_mismatch.load(std::memory_order_relaxed);
         uint64_t latency = stats.total_latency_us.load(std::memory_order_relaxed);
         
         double avg_latency_us = recv > 0 ? (double)latency / recv : 0.0;
@@ -300,10 +330,12 @@ void generateFinalReport() {
         std::cout << "    Received:    " << recv << "\n";
         std::cout << "    Lost:        " << lost << " (" << loss_rate << "%)\n";
         std::cout << "    Out-of-Order:" << ooo << "\n";
+        std::cout << "    Data Mismatch:" << mismatch << "\n";
         std::cout << "    Avg Latency: " << (avg_latency_us / 1000.0) << " ms\n\n";
         
         total_lost += lost;
         total_ooo += ooo;
+        total_mismatch += mismatch;
         total_latency += latency;
         total_recv += recv;
     }
@@ -317,10 +349,11 @@ void generateFinalReport() {
     std::cout << "Summary:\n";
     std::cout << "  Loss Rate:       " << overall_loss_rate << "%\n";
     std::cout << "  Out-of-Order:    " << total_ooo << "\n";
+    std::cout << "  Data Mismatch:   " << total_mismatch << "\n";
     std::cout << "  Average Latency: " << overall_avg_latency_ms << " ms\n\n";
     
     // 判断测试结果
-    bool passed = (overall_loss_rate < 0.01 && total_ooo == 0);
+    bool passed = (overall_loss_rate < 0.01 && total_ooo == 0 && total_mismatch == 0);
     if (passed) {
         std::cout << "✅ DATA INTEGRITY TEST PASSED!\n";
     } else {
@@ -330,6 +363,9 @@ void generateFinalReport() {
         }
         if (total_ooo > 0) {
             std::cout << "   Reason: Out-of-order messages (" << total_ooo << ")\n";
+        }
+        if (total_mismatch > 0) {
+            std::cout << "   Reason: Data mismatch (" << total_mismatch << ")\n";
         }
     }
     

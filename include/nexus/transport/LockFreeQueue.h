@@ -21,16 +21,21 @@ namespace rpc {
  * - Memory barriers for proper synchronization
  * - Overflow handling: drop oldest messages
  */
-template <size_t CAPACITY>
+template <size_t BUFFER_SIZE>
 class alignas(64) LockFreeRingBuffer {
 public:
-    static constexpr size_t MAX_MSG_SIZE = 2048;  // Max message size
+    // Optimized for variable length messages
+    // Header: 8 bytes (length + magic)
+    // Payload: Variable
+    static constexpr size_t MAX_MSG_SIZE = 2040;
 
-    struct alignas(64) Message {
-        uint32_t size;          // Message payload size
-        char from_node_id[32];  // Sender node ID
-        uint8_t payload[MAX_MSG_SIZE];
+    struct FrameHeader {
+        uint32_t length; // Total length including header. If 0, it's padding.
+        uint32_t magic;  // Magic number to detect padding/validity
     };
+    
+    static constexpr uint32_t MAGIC_VALID = 0xCAFEBABE;
+    static constexpr uint32_t MAGIC_PADDING = 0xDEADBEEF;
 
     LockFreeRingBuffer() {
         head_.store(0, std::memory_order_relaxed);
@@ -38,95 +43,153 @@ public:
         stats_messages_written_.store(0, std::memory_order_relaxed);
         stats_messages_read_.store(0, std::memory_order_relaxed);
         stats_messages_dropped_.store(0, std::memory_order_relaxed);
+        // Initialize buffer with zeros to avoid confusion? Not strictly necessary.
+        memset(buffer_, 0, BUFFER_SIZE);
     }
 
     /**
      * @brief Try to write a message (producer side)
-     * @param from_node_id Sender node ID
      * @param data Message data
      * @param size Message size
      * @return true if written successfully, false if queue is full
      */
-    bool tryWrite(const char* from_node_id, const uint8_t* data, size_t size) {
-        if (size > MAX_MSG_SIZE) {
+    bool tryWrite(const uint8_t* data, size_t size) {
+        if (size > MAX_MSG_SIZE || size == 0) {
             return false;
         }
 
-        // Load indices with acquire semantics
-        uint64_t current_head = head_.load(std::memory_order_acquire);
-        uint64_t current_tail = tail_.load(std::memory_order_acquire);
+        // Calculate required space aligned to 8 bytes
+        // Header (8) + Data (size) + Padding (0-7)
+        size_t needed = (sizeof(FrameHeader) + size + 7) & ~7;
 
-        // Check if queue is full
-        uint64_t next_head = current_head + 1;
-        if (next_head - current_tail > CAPACITY) {
-            // Queue full - drop oldest message to make room
-            tail_.store(current_tail + 1, std::memory_order_release);
-            stats_messages_dropped_.fetch_add(1, std::memory_order_relaxed);
+        // Load indices with acquire semantics
+        uint64_t head = head_.load(std::memory_order_acquire);
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+
+        // Check space and write
+        if (head >= tail) {
+            // Free space: [head, BUFFER_SIZE) and [0, tail)
+            
+            // Try to fit at the end
+            if (head + needed <= BUFFER_SIZE) {
+                writeFrame(head, data, size, needed, MAGIC_VALID);
+                head_.store(head + needed, std::memory_order_release);
+                stats_messages_written_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            
+            // Try to wrap around
+            // We need to write padding at [head, BUFFER_SIZE)
+            // And write data at [0, tail)
+            
+            // Check if we have enough space at the beginning
+            // We need 'needed' bytes strictly less than 'tail' to avoid head==tail (empty)
+            if (needed < tail) {
+                // Write padding at the end
+                size_t pad_len = BUFFER_SIZE - head;
+                if (pad_len >= sizeof(FrameHeader)) {
+                    FrameHeader padHdr = {static_cast<uint32_t>(pad_len), MAGIC_PADDING};
+                    memcpy(&buffer_[head], &padHdr, sizeof(padHdr));
+                }
+                
+                // Write data at 0
+                writeFrame(0, data, size, needed, MAGIC_VALID);
+                head_.store(needed, std::memory_order_release);
+                stats_messages_written_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        } else {
+            // head < tail
+            // Free space: [head, tail)
+            if (head + needed < tail) {
+                writeFrame(head, data, size, needed, MAGIC_VALID);
+                head_.store(head + needed, std::memory_order_release);
+                stats_messages_written_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
         }
 
-        // Write message
-        size_t index = current_head % CAPACITY;
-        Message& msg = buffer_[index];
-
-        msg.size = static_cast<uint32_t>(size);
-        strncpy(msg.from_node_id, from_node_id, sizeof(msg.from_node_id) - 1);
-        msg.from_node_id[sizeof(msg.from_node_id) - 1] = '\0';
-        memcpy(msg.payload, data, size);
-
-        // Publish the write with release semantics
-        std::atomic_thread_fence(std::memory_order_release);
-        head_.store(next_head, std::memory_order_release);
-
-        stats_messages_written_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        // Queue full
+        stats_messages_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
 
     /**
      * @brief Try to read a message (consumer side)
-     * @param out_from_node_id Output buffer for sender node ID (min 32 bytes)
      * @param out_data Output buffer for message data (min MAX_MSG_SIZE bytes)
      * @param out_size Output message size
      * @return true if read successfully, false if queue is empty
      */
-    bool tryRead(char* out_from_node_id, uint8_t* out_data, size_t& out_size) {
+    bool tryRead(uint8_t* out_data, size_t& out_size) {
         // Load indices with acquire semantics
-        uint64_t current_tail = tail_.load(std::memory_order_acquire);
-        uint64_t current_head = head_.load(std::memory_order_acquire);
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        uint64_t head = head_.load(std::memory_order_acquire);
 
-        // Check if queue is empty
-        if (current_tail >= current_head) {
+        if (tail == head) {
             return false;
         }
 
-        // Read message
-        size_t index = current_tail % CAPACITY;
-        const Message& msg = buffer_[index];
+        // Read header
+        FrameHeader header;
+        memcpy(&header, &buffer_[tail], sizeof(header));
 
-        out_size = msg.size;
-        strncpy(out_from_node_id, msg.from_node_id, 32);
-        memcpy(out_data, msg.payload, msg.size);
+        // Handle padding
+        if (header.magic == MAGIC_PADDING) {
+            // Wrap around
+            tail = 0;
+            // Update tail to 0 and re-check
+            // Note: We don't update tail_ yet, we just move our local pointer
+            // But wait, if we don't update tail_, the producer won't see the space freed.
+            // However, we are consuming the padding.
+            // Let's update tail_ to 0.
+            tail_.store(0, std::memory_order_release);
+            
+            if (tail == head) {
+                return false; // Should not happen if padding exists
+            }
+            memcpy(&header, &buffer_[tail], sizeof(header));
+        }
+
+        if (header.magic != MAGIC_VALID) {
+            // Corruption or race?
+            return false;
+        }
+
+        size_t payload_len = header.length;
+        if (payload_len > MAX_MSG_SIZE) {
+             // Corruption
+             return false;
+        }
+
+        // Calculate total length (aligned)
+        size_t total_len = (sizeof(FrameHeader) + payload_len + 7) & ~7;
+
+        memcpy(out_data, &buffer_[tail + sizeof(FrameHeader)], payload_len);
+        out_size = payload_len;
 
         // Advance tail with release semantics
-        std::atomic_thread_fence(std::memory_order_release);
-        tail_.store(current_tail + 1, std::memory_order_release);
+        tail_.store(tail + total_len, std::memory_order_release);
 
         stats_messages_read_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     /**
-     * @brief Get number of messages in queue
+     * @brief Get number of bytes used (approximate)
      */
     size_t size() const {
-        uint64_t current_head = head_.load(std::memory_order_acquire);
-        uint64_t current_tail = tail_.load(std::memory_order_acquire);
-        return static_cast<size_t>(current_head - current_tail);
+        uint64_t head = head_.load(std::memory_order_acquire);
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        if (head >= tail) return head - tail;
+        return BUFFER_SIZE - (tail - head);
     }
 
     /**
      * @brief Check if queue is empty
      */
-    bool empty() const { return size() == 0; }
+    bool empty() const { 
+        return head_.load(std::memory_order_relaxed) == tail_.load(std::memory_order_relaxed); 
+    }
 
     /**
      * @brief Get statistics
@@ -145,9 +208,21 @@ public:
     }
 
 private:
+    void writeFrame(size_t offset, const uint8_t* data, size_t payload_size, size_t total_len, uint32_t magic) {
+        FrameHeader hdr;
+        if (magic == MAGIC_VALID) {
+            hdr.length = static_cast<uint32_t>(payload_size);
+        } else {
+            hdr.length = static_cast<uint32_t>(total_len);
+        }
+        hdr.magic = magic;
+        memcpy(&buffer_[offset], &hdr, sizeof(hdr));
+        memcpy(&buffer_[offset + sizeof(hdr)], data, payload_size);
+    }
+
     // Cache-line aligned atomic indices to avoid false sharing
-    alignas(64) std::atomic<uint64_t> head_;  // Write position (producer)
-    alignas(64) std::atomic<uint64_t> tail_;  // Read position (consumer)
+    alignas(64) std::atomic<uint64_t> head_;  // Write position (byte offset)
+    alignas(64) std::atomic<uint64_t> tail_;  // Read position (byte offset)
 
     // Statistics (relaxed ordering is fine)
     alignas(64) std::atomic<uint64_t> stats_messages_written_;
@@ -155,7 +230,7 @@ private:
     alignas(64) std::atomic<uint64_t> stats_messages_dropped_;
 
     // Message buffer
-    alignas(64) Message buffer_[CAPACITY];
+    alignas(64) uint8_t buffer_[BUFFER_SIZE];
 };
 
 }  // namespace rpc

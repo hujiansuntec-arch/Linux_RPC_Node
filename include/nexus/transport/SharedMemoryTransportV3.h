@@ -50,8 +50,14 @@ public:
         SMART_POLLING        // 智能轮询 (自旋+指数退避，超低延迟)
     };
 
-    static constexpr size_t QUEUE_CAPACITY = 256;
-    static constexpr size_t MAX_INBOUND_QUEUES = 64;  // Max senders to this node (absolute limit, 降低到64)
+    // Queue capacities in bytes (Variable-length RingBuffer)
+    // Control Queue: 128KB (Enough for ~2000 small control messages)
+    static constexpr size_t CONTROL_QUEUE_SIZE_BYTES = 16 * 1024;
+    // Data Queue: 512KB (Enough for ~256 large 2KB messages or ~8000 small messages)
+    static constexpr size_t DATA_QUEUE_SIZE_BYTES = 524288;
+
+    static constexpr size_t QUEUE_CAPACITY = DATA_QUEUE_SIZE_BYTES;
+    static constexpr size_t MAX_INBOUND_QUEUES = 32;  // Max senders to this node (absolute limit, 降低到64)
 
     struct Config {
         size_t queue_capacity;
@@ -62,7 +68,7 @@ public:
 
         Config()
             : queue_capacity(QUEUE_CAPACITY),
-              max_inbound_queues(32)  // 默认32（进一步降低内存占用）
+              max_inbound_queues(MAX_INBOUND_QUEUES)  // 默认32（进一步降低内存占用）
               ,
               enable_stats(true),
               auto_cleanup(true),
@@ -203,13 +209,13 @@ private:
         std::atomic<uint32_t> control_pending;  // 待处理控制消息计数
         sem_t control_sem;                      // SEM模式: POSIX信号量
         char control_sem_padding[64 - sizeof(sem_t)];
-        LockFreeRingBuffer<64> control_queue;  // 控制队列容量64（控制消息少）
+        LockFreeRingBuffer<CONTROL_QUEUE_SIZE_BYTES> control_queue;
 
         // 🔧 数据队列（正常优先级）：普通数据消息
         std::atomic<uint32_t> data_pending;
         sem_t data_sem;
         char data_sem_padding[64 - sizeof(sem_t)];
-        LockFreeRingBuffer<QUEUE_CAPACITY> data_queue;  // 数据队列容量256
+        LockFreeRingBuffer<DATA_QUEUE_SIZE_BYTES> data_queue;
 
         // 🔧 流控：背压机制
         std::atomic<uint32_t> congestion_level;  // 拥塞等级 0-100

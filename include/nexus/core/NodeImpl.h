@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <set>
 #include <thread>
@@ -168,7 +169,7 @@ private:
     std::atomic<bool> running_;
 
     // Local subscriptions: group -> SubscriptionInfo
-    mutable std::mutex subscriptions_mutex_;
+    mutable std::shared_timed_mutex subscriptions_mutex_;
     std::map<std::string, SubscriptionInfo> subscriptions_;
 
     // Remote nodes registry: node_id -> RemoteNodeInfo

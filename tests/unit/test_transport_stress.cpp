@@ -66,10 +66,13 @@ TEST(TransportStress, Congestion) {
     
     // Don't start receiving yet to fill queue
     
-    // Send many messages (more than 256)
+    // Send many messages (more than capacity)
+    // Queue capacity is 512KB.
+    // If we send 2000 bytes per message, capacity is ~261 messages.
+    // We send 300 messages to trigger overflow.
     int sent = 0;
     int total_to_send = 300;
-    std::vector<uint8_t> data(100, 0);
+    std::vector<uint8_t> data(2000, 0);
     
     // Wait for connection establishment
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -86,8 +89,10 @@ TEST(TransportStress, Congestion) {
         }
     }
     
-    // With Ring Buffer, sends always succeed (overwriting old data)
-    ASSERT_EQ(sent, total_to_send);
+    // With Ring Buffer (SPSC), producer cannot move tail, so it cannot overwrite oldest.
+    // Instead, it returns false (Drop Newest / Block).
+    // So sent count should be less than total (we hit capacity).
+    ASSERT_LT(sent, total_to_send);
     
     // Now start receiving to clear
     std::atomic<int> received{0};
@@ -105,30 +110,26 @@ TEST(TransportStress, Congestion) {
     
     for(int i=0; i<100; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     
-    // Should receive at most capacity (256)
-    // The queue capacity is 256.
-    ASSERT_TRUE(received <= 256);
+    // Should receive exactly what was sent
+    ASSERT_EQ(received, sent);
     ASSERT_GT(received, 0);
     
-    // Verify we got the latest messages
+    // Verify we got the FIRST messages (Drop Newest behavior)
     if (received > 0) {
         std::lock_guard<std::mutex> lock(received_mutex);
-        // The last message sent was 299. It should be in the buffer.
+        // The last message sent (299) should be dropped because queue was full
         bool found_last = false;
         for(int id : received_ids) {
             if(id == 299) found_last = true;
         }
-        ASSERT_TRUE(found_last);
+        ASSERT_FALSE(found_last);
         
-        // The first message (0) should be dropped (overwritten)
+        // The first message (0) should be present
         bool found_first = false;
         for(int id : received_ids) {
             if(id == 0) found_first = true;
         }
-        // It is possible 0 was sent before connection established?
-        // But we waited.
-        // If we sent 300, and capacity is 256, 0 should be gone.
-        ASSERT_FALSE(found_first);
+        ASSERT_TRUE(found_first);
     }
     
     t2.stopReceiving();
